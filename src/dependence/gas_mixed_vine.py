@@ -1,3 +1,6 @@
+import networkx as nx
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,39 +9,36 @@ import pyvinecopulib as pv
 import matplotlib.pyplot as plt
 from scipy.stats import norm
 from scipy.special import stdtrit, stdtr
+from matplotlib.lines import Line2D
 
 # Exact Inverse Student-t CDF bridging Scipy (forward) and PyTorch (backward)
 class InverseStudentT(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, u, nu):
-        # Detach to numpy for Scipy calculation
         u_cpu = u.detach().cpu().numpy()
         nu_cpu = nu.detach().cpu().numpy()
-        
-        # Exact calculation using Scipy's Cephes library
+        # Clamp to avoid inf at boundaries
+        u_cpu = np.clip(u_cpu, 1e-9, 1 - 1e-9)
         x = stdtrit(nu_cpu, u_cpu)
-        
-        # Convert back to Tensor
         x_tensor = torch.from_numpy(x).to(u.device, dtype=u.dtype)
-        
-        # Save for backward pass
         ctx.save_for_backward(x_tensor, nu)
         return x_tensor
 
     @staticmethod
     def backward(ctx, grad_output):
         x, nu = ctx.saved_tensors
-        # Derivative of Inverse CDF is 1 / PDF(x)
-        # We compute 1/PDF directly in Log Space for numerical stability
-        
         pi = torch.tensor(3.1415926535, device=x.device)
+        
+        # Log-space PDF calculation for stability
         log_const = torch.lgamma((nu + 1) / 2) - torch.lgamma(nu / 2) - 0.5 * torch.log(nu * pi)
         log_kernel = -((nu + 1) / 2) * torch.log(1 + (x**2) / nu)
         log_pdf = log_const + log_kernel
         
         pdf = torch.exp(log_pdf)
-        grad_u = grad_output / pdf  # Chain rule: dL/du = dL/dx * dx/du
+        # Prevent division by zero if PDF underflows in deep tails
+        pdf = torch.clamp(pdf, min=1e-12) 
+        
+        grad_u = grad_output / pdf 
         return grad_u, None
 
 def inverse_t_cdf(u, nu):
@@ -66,26 +66,26 @@ class GASPairCopula(nn.Module):
     # Returns valid degrees of freedom > 2.0
     def get_nu(self):
         if self.nu_unconstrained is None: return None
-        return torch.nn.functional.softplus(self.nu_unconstrained) + 2.01
+        return torch.clamp(torch.nn.functional.softplus(self.nu_unconstrained) + 2.01, 2.01, 30)
 
     # Handles data rotation for copula families
     def rotate_data(self, u, v):
-        if self.rotation == 0: return u, v
         if self.rotation == 90: return 1-u, v
         if self.rotation == 180: return 1-u, 1-v
         if self.rotation == 270: return u, 1-v
         return u, v
-
+    
     # Maps unbounded GAS factor f_t to valid copula parameter space
     def transform_parameter(self, f_t):
         if 'gaussian' in self.family or 'student' in self.family:
-            return torch.tanh(f_t) # (-1, 1)
+            return torch.tanh(f_t) 
         elif 'clayton' in self.family:
-            return torch.nn.functional.softplus(f_t) + 1e-4 # (> 0)
+            return torch.clamp(torch.nn.functional.softplus(f_t) + 1e-4, 1e-4, 20.0)
         elif 'gumbel' in self.family or 'joe' in self.family:
-            return torch.nn.functional.softplus(f_t) + 1.0 + 1e-4 # (>= 1)
+            return torch.clamp(torch.nn.functional.softplus(f_t) + 1.0 + 1e-4, 1.001, 20.0)
         elif 'frank' in self.family:
-            return f_t + torch.sign(f_t) * 1e-4 if torch.abs(f_t) < 1e-4 else f_t # (!= 0)
+            val = f_t + torch.sign(f_t) * 1e-4 if torch.abs(f_t) < 1e-4 else f_t
+            return torch.clamp(val, -30.0, 30.0)
         return f_t
 
     # Compute the log-likelihood for a batch of (u, v) given theta
@@ -98,22 +98,20 @@ class GASPairCopula(nn.Module):
         v_rot = torch.clamp(v_rot, eps, 1 - eps)
 
         if 'gaussian' in self.family:
-            rho = theta
+            rho = torch.clamp(theta, -0.999, 0.999)
             n = torch.distributions.Normal(0, 1)
             x, y = n.icdf(u_rot), n.icdf(v_rot)
-            rho2 = rho**2
 
-            # Gaussian Copula Log-PDF          
+            # Gaussian Copula Log-PDF  
+            rho2 = rho**2      
             z = x**2 + y**2 - 2*rho*x*y
-            log_det = 0.5 * torch.log(1 - rho2)
-            log_exp = -0.5 * (z / (1 - rho2) - (x**2 + y**2))
+            log_det = 0.5 * torch.log(1 - rho2 + 1e-8)
+            log_exp = -0.5 * (z / (1 - rho2 + 1e-8) - (x**2 + y**2))
 
             return -log_det + log_exp
 
         elif 'student' in self.family:
-            rho = theta
-
-            # Exact Student-t Log-Likelihood
+            rho = torch.clamp(theta, -0.999, 0.999)
             if nu is None: nu = torch.tensor(5.0, device=u.device)
             
             # Transform Uniforms (u,v) -> T-Scores (x,y)
@@ -122,15 +120,14 @@ class GASPairCopula(nn.Module):
             
             # Joint Log-Density: log c(u,v) = log(f_mv(x,y)) - log(f(x)) - log(f(y))
             rho2 = rho**2
-            log_det = -0.5 * torch.log(1 - rho2)
-            zeta = (x**2 + y**2 - 2*rho*x*y) / (1 - rho2)
+            log_det = -0.5 * torch.log(1 - rho2 + 1e-8)
+            zeta = (x**2 + y**2 - 2*rho*x*y) / (1 - rho2 + 1e-8)
 
             joint_kernel = -((nu + 2) / 2) * torch.log(1 + zeta / nu)
             marg_kernel_x = ((nu + 1) / 2) * torch.log(1 + (x**2) / nu)
             marg_kernel_y = ((nu + 1) / 2) * torch.log(1 + (y**2) / nu)
             
             log_gamma_const = torch.lgamma((nu + 2) / 2) + torch.lgamma(nu / 2) - 2 * torch.lgamma((nu + 1) / 2)
-            
             return log_gamma_const + log_det + joint_kernel + marg_kernel_x + marg_kernel_y
 
         elif 'clayton' in self.family:
@@ -144,6 +141,8 @@ class GASPairCopula(nn.Module):
         elif 'gumbel' in self.family:
             t = theta
             x, y = -torch.log(u_rot), -torch.log(v_rot)
+            x = torch.clamp(x, min=eps)
+            y = torch.clamp(y, min=eps)
             sum_pow = torch.pow(x**t + y**t, 1/t)
             return torch.log(sum_pow + t - 1) - sum_pow + (t-1)*(torch.log(x)+torch.log(y)) - torch.log(u_rot*v_rot) - 2*torch.log(u_rot*v_rot) # Simplified correction
 
@@ -159,7 +158,7 @@ class GASPairCopula(nn.Module):
     # Computes h(u|v) = dC/dv for vine propagation
     def compute_h_func(self, u, v, theta, nu=None):
         u_rot, v_rot = self.rotate_data(u, v)
-        eps = 1e-6
+        eps = 1e-5
         u_rot = torch.clamp(u_rot, eps, 1-eps)
         v_rot = torch.clamp(v_rot, eps, 1-eps)
         
@@ -169,28 +168,26 @@ class GASPairCopula(nn.Module):
             n = torch.distributions.Normal(0,1)
             x = n.icdf(u_rot)
             y = n.icdf(v_rot)
+            denom = torch.sqrt(1 - rho**2 + 1e-8) 
 
-            h_val = n.cdf((x - rho*y) / torch.sqrt(1 - rho**2))
+            h_val = n.cdf((x - rho*y) / denom)
 
         elif 'student' in self.family:
             if nu is None: nu = torch.tensor(5.0)
-            
-            # Autograd on v to get derivative
-            v_leaf = v_rot.detach().requires_grad_(True)
-            u_leaf = u_rot.detach()
-            
-            # Re-implement CDF for Student-t
-            x = inverse_t_cdf(u_leaf, nu)
-            y = inverse_t_cdf(v_leaf, nu)
             rho = torch.clamp(theta, -0.999, 0.999)
+            
+            u_in = u_rot.detach()
+            v_in = v_rot.detach()
+            
+            x = inverse_t_cdf(u_in, nu)
+            y = inverse_t_cdf(v_in, nu)
             
             num = x - rho * y
             den = torch.sqrt((1 - rho**2) * (nu + y**2) / (nu + 1) + 1e-8)
-            arg = (num / den).detach().cpu().numpy()
-
+            arg = (num / den).cpu().numpy()
             df_np = (nu + 1).detach().cpu().numpy()
+
             cdf_val = stdtr(df_np, arg)
-            
             h_val = torch.tensor(cdf_val, dtype=u.dtype, device=u.device)
 
         elif 'clayton' in self.family:
@@ -199,39 +196,39 @@ class GASPairCopula(nn.Module):
             # Formula: v^(-t-1) * (u^-t + v^-t - 1)^(-1/t - 1)
             term1 = -(t + 1) * torch.log(v_rot)
             base = torch.pow(u_rot, -t) + torch.pow(v_rot, -t) - 1
-            term2 = -(1/t + 1) * torch.log(torch.clamp(base, min=eps))
+            base = torch.clamp(base, min=eps)
+            term2 = -(1/t + 1) * torch.log(base)
 
             h_val = torch.exp(term1 + term2)
 
         elif 'gumbel' in self.family:
             t = theta
-
-            # Formula: C(u,v) * [(-ln v)^(t-1) / v] * [(-ln u)^t + (-ln v)^t]^(1/t - 1)
             x = -torch.log(u_rot)
             y = -torch.log(v_rot)
-            x = torch.clamp(x, min=1e-6)
-            y = torch.clamp(y, min=1e-6)
-            
-            sum_pow = torch.pow(x**t + y**t, 1/t) # This is -log(C)
-            log_C = -sum_pow
-            log_term2 = (t - 1) * torch.log(y) + y 
-            log_term3 = (1/t - 1) * torch.log(x**t + y**t)
-            
-            h_val = torch.exp(log_C + log_term2 + log_term3)
+            x = torch.clamp(x, min=eps)
+            y = torch.clamp(y, min=eps)
+
+            # Formula: C(u,v) * [(-ln v)^(t-1) / v] * [(-ln u)^t + (-ln v)^t]^(1/t - 1)
+            sum_pow = torch.pow(x**t + y**t, 1/t)
+            term1 = sum_pow + (t-1)*torch.log(x)
+            term2 = torch.log(x**t + y**t) * (1/t - 1)
+
+            h_val = torch.exp(-sum_pow + (t-1)*torch.log(x) + (1/t - 1)*torch.log(x**t + y**t)) / u_rot
 
         elif 'frank' in self.family:
             t = theta
             eu = torch.exp(-t * u_rot) - 1
-            et = torch.exp(-t) - 1
-            
             num = eu * torch.exp(-t * v_rot)
-            den = torch.sign(den) * torch.max(torch.abs(den), torch.tensor(1e-6))
+            den = (1 - torch.exp(-t)) - (1 - torch.exp(-t * u_rot)) * (1 - torch.exp(-t * v_rot))
+            den = torch.sign(den) * torch.max(torch.abs(den), torch.tensor(eps, device=u.device))
+            
             h_val = num / den
 
         # Un-Rotate H-Function
         if self.rotation == 90: return 1 - h_val
         if self.rotation == 270: return 1 - h_val
-        return h_val
+
+        return torch.clamp(h_val, 1e-6, 1 - 1e-6)
 
     def forward(self, u_data, v_data):
         T = u_data.shape[0]
@@ -252,11 +249,18 @@ class GASPairCopula(nn.Module):
             ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu_val)
             
             # Compute Score = dLL/df_t via Autograd
-            score = torch.autograd.grad(ll, f_t_leaf, create_graph=True)[0]
-            score = torch.clamp(score, -5.0, 5.0)
+            score = torch.autograd.grad(ll, f_t_leaf, create_graph=True, allow_unused=True)[0]
+
+            if score is None or torch.isnan(score) or torch.isinf(score):
+                score = torch.tensor(0.0, device=u_data.device) # Neutralize the shock
+            else:
+                score = torch.clamp(score, -5.0, 5.0) # Prevent explosion
             
             # GAS Update
             f_next = self.omega + self.A * score + self.B * f_t
+            if torch.isnan(f_next) or torch.isinf(f_next):
+                f_next = f_t.detach() * 0.98
+
             log_likes.append(ll)
             f_t = f_next.detach()
             
@@ -270,14 +274,12 @@ def fit_mixed_gas_vine(u_matrix, structure):
     
     # Parse Structure Matrix
     M = np.array(structure.matrix)
-    if M.max() == N:
-        print("Detected 1-based indexing in structure matrix. Adjusting to 0-based...")
-        M = np.where(M > 0, M - 1, M)
+    if M.max() == N: M = np.where(M > 0, M - 1, M)
         
     fams = structure.pair_copulas
-    
-    # Initialize Triangular Grid
     vine_data = torch.zeros((N, N, T), device=device)
+    
+    # Initialize Triangular Grid with rax data
     for i in range(N):
         var_idx = int(M[i, i])
         vine_data[i, i] = u_tensor[:, var_idx]
@@ -306,7 +308,7 @@ def fit_mixed_gas_vine(u_matrix, structure):
                 
                 u_vec = u_tensor[:, var1_idx]
                 v_vec = u_tensor[:, var2_idx]
-                
+
                 # For storage later: we need to know where 'v' "lives" in the matrix row
                 # In the bottom row, var2 is just the diagonal variable.
                 # We identify it by finding which column p in this row holds var2_idx.
@@ -326,12 +328,15 @@ def fit_mixed_gas_vine(u_matrix, structure):
                         partner_col = p
                         break
                 
-                if partner_col == -1: 
-                    partner_col = m_row + 1
+                if partner_col == -1: partner_col = m_row + 1
                 
                 # Fetch transformed variables
                 u_vec = vine_data[m_row + 1, m_col]
                 v_vec = vine_data[m_row + 1, partner_col]
+
+            # NAN FILLER FOR INPUTS
+            if torch.isnan(u_vec).any(): u_vec = torch.nan_to_num(u_vec, 0.5)
+            if torch.isnan(v_vec).any(): v_vec = torch.nan_to_num(v_vec, 0.5)
 
             # Fit GAS Model
             pc = fams[tree][edge]
@@ -346,46 +351,122 @@ def fit_mixed_gas_vine(u_matrix, structure):
             else:
                 # Initialize and Train
                 model = GASPairCopula(fam_str, rotation=rot).to(device)
-                optimizer = optim.LBFGS(model.parameters(), lr=0.1, max_iter=20, line_search_fn='strong_wolfe')
+                optimizer = optim.Adam(model.parameters(), lr=0.02)
                 
-                def closure():
+                for _ in range(50):
                     optimizer.zero_grad()
                     loss, _ = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
+                    if torch.isnan(loss): break 
                     loss.backward()
-                    return loss
-                optimizer.step(closure)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
                 
                 # Extract Path
                 _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
+                theta_path = torch.nan_to_num(theta_path, 0.0) # Safety
                 fitted_paths[f"T{tree}_E{edge}"] = theta_path.detach().cpu().numpy()
-                
+
                 # Compute H-functions for next level
-                theta_path = theta_path.detach()
                 nu_val = model.get_nu()
-                
                 h_d_list = []
                 h_i_list = []
+
                 with torch.no_grad():
-                    for t in range(T):
-                        # h(u|v) -> Direct
-                        h1 = model.compute_h_func(u_vec[t:t+1], v_vec[t:t+1], theta_path[t], nu_val)
-                        h_d_list.append(h1)
-                        # h(v|u) -> Indirect (Swap args)
-                        h2 = model.compute_h_func(v_vec[t:t+1], u_vec[t:t+1], theta_path[t], nu_val)
-                        h_i_list.append(h2)
-                        
-                h_direct = torch.cat(h_d_list).squeeze()
-                h_indirect = torch.cat(h_i_list).squeeze()
+                    h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
+                    h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
 
             # Update Grid
             vine_data[m_row, m_col] = h_direct
-            
             if partner_col != -1 and partner_col != m_col:
                  vine_data[m_row, partner_col] = h_indirect
             elif tree == 0 and partner_col != -1:
                  vine_data[m_row, partner_col] = h_indirect
             
-    return fitted_paths
+    return fitted_paths, structure
+
+# Visualizes the R-Vine structure (Matrix + Families)
+def plot_vine_structure(structure, num_assets):
+    """
+    1. Plots the Network Graph of Tree 1 (The most important dependencies).
+    2. Prints a summary distribution of Copula Families across all trees.
+    """
+    M = np.array(structure.matrix)
+    if M.max() == num_assets: M = np.where(M > 0, M - 1, M) # 0-based fix
+    
+    fams = structure.pair_copulas
+    
+    # --- 1. VISUALIZE TREE 1 (Network Graph) ---
+    print("\n--- Generating Tree 1 Network Graph ---")
+    G = nx.Graph()
+    
+    # Add nodes (Assets 0 to N-1)
+    for i in range(num_assets):
+        G.add_node(i, label=f"Asset {i}")
+    
+    # Edges in Tree 1 are defined by the bottom row of the R-Vine Matrix
+    # Pair at col j connects: M[N-1, j] <--> M[j, j]
+    row = num_assets - 1
+    edge_colors = []
+    families_tree1 = []
+    
+    for j in range(num_assets - 1):
+        u = M[row, j] # First variable
+        v = M[j, j]   # Second variable (diagonal)
+        
+        # Get Family
+        pc = fams[0][j]
+        fam_name = str(pc.family).split('.')[-1]
+        families_tree1.append(fam_name)
+        
+        G.add_edge(u, v, family=fam_name)
+        
+        # Color coding
+        if 'clayton' in fam_name.lower(): edge_colors.append('red')      # Crash Risk
+        elif 'gumbel' in fam_name.lower(): edge_colors.append('green')   # Boom Risk
+        elif 'student' in fam_name.lower(): edge_colors.append('purple') # Fat Tails
+        elif 'gaussian' in fam_name.lower(): edge_colors.append('blue')  # Standard
+        elif 'frank' in fam_name.lower(): edge_colors.append('orange')   # Symmetric
+        else: edge_colors.append('gray')
+
+    plt.figure(figsize=(10, 8))
+    pos = nx.spring_layout(G, k=0.5, seed=42) # k regulates distance
+    
+    nx.draw_networkx_nodes(G, pos, node_size=700, node_color='lightgray')
+    nx.draw_networkx_labels(G, pos, font_weight='bold')
+    nx.draw_networkx_edges(G, pos, width=2, edge_color=edge_colors)
+    
+    # Create a custom legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='red', lw=2, label='Clayton (Lower Tail)'),
+        Line2D([0], [0], color='green', lw=2, label='Gumbel (Upper Tail)'),
+        Line2D([0], [0], color='purple', lw=2, label='Student-t (Fat Tails)'),
+        Line2D([0], [0], color='blue', lw=2, label='Gaussian (Linear)'),
+        Line2D([0], [0], color='orange', lw=2, label='Frank (Symmetric)'),
+        Line2D([0], [0], color='gray', lw=2, label='Independence')
+    ]
+    plt.legend(handles=legend_elements, loc='upper left')
+    plt.title("Tree 1 Topology: Dominant Market Dependencies")
+    plt.axis('off')
+    plt.show()
+
+    # --- 2. SUMMARY STATISTICS (All Trees) ---
+    print("\n--- Copula Family Distribution ---")
+    all_families = []
+    for tree in fams:
+        for pc in tree:
+            all_families.append(str(pc.family).split('.')[-1])
+            
+    df_fam = pd.DataFrame(all_families, columns=['Family'])
+    counts = df_fam['Family'].value_counts(normalize=True) * 100
+    
+    print(counts)
+
+    plt.figure(figsize=(8, 4))
+    sns.barplot(x=counts.index, y=counts.values, palette='viridis')
+    plt.ylabel("Percentage (%)")
+    plt.title("Distribution of Copula Families across all Trees")
+    plt.show()
 
 if __name__ == "__main__":
     print("1. Generating Synthetic 14-Asset Data...")
@@ -416,5 +497,7 @@ if __name__ == "__main__":
     plt.title("Recovered Dynamic Dependence (GAS Parameters)")
     plt.legend()
     plt.show()
+
+    plot_vine_structure(structure, N)
     
-    print("Success. Model is Thesis-Ready.")
+    print("Done")

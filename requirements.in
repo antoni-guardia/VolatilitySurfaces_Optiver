@@ -12,3 +12,6 @@ statsmodels
 pyvinecopulib
 torchsde
 optuna
+networkx
+graphviz
+plotly
