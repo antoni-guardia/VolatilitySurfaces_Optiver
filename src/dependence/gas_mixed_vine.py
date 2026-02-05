@@ -269,7 +269,7 @@ class GASPairCopula(nn.Module):
 # Fits GAS dynamics to a generic R-Vine structure using Dißmann algorithm
 def fit_mixed_gas_vine(u_matrix, structure):
     T, N = u_matrix.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     u_tensor = torch.tensor(u_matrix, dtype=torch.float32).to(device)
     
     # Parse Structure Matrix
@@ -351,15 +351,19 @@ def fit_mixed_gas_vine(u_matrix, structure):
             else:
                 # Initialize and Train
                 model = GASPairCopula(fam_str, rotation=rot).to(device)
-                optimizer = optim.Adam(model.parameters(), lr=0.02)
-                
-                for _ in range(50):
+                optimizer = optim.LBFGS(model.parameters(), lr=1, max_iter=20, line_search_fn='strong_wolfe')
+
+                def closure():
                     optimizer.zero_grad()
                     loss, _ = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
-                    if torch.isnan(loss): break 
+                    if torch.isnan(loss): return loss # Safety break
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    return loss
+
+                try:
+                    optimizer.step(closure)
+                except Exception as e:
+                    print(f"  [Warn] Optimization unstable for Edge {edge}. Keeping init params.")
                 
                 # Extract Path
                 _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
@@ -368,9 +372,6 @@ def fit_mixed_gas_vine(u_matrix, structure):
 
                 # Compute H-functions for next level
                 nu_val = model.get_nu()
-                h_d_list = []
-                h_i_list = []
-
                 with torch.no_grad():
                     h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
                     h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
@@ -467,37 +468,3 @@ def plot_vine_structure(structure, num_assets):
     plt.ylabel("Percentage (%)")
     plt.title("Distribution of Copula Families across all Trees")
     plt.show()
-
-if __name__ == "__main__":
-    print("1. Generating Synthetic 14-Asset Data...")
-    T = 1250 
-    N = 14
-    # Create random covariance
-    A = np.random.rand(N, N)
-    cov = np.dot(A, A.transpose())
-    data_mvn = np.random.multivariate_normal(np.zeros(N), cov, size=T)
-    data_u = norm.cdf(data_mvn)
-    
-    print("2. Selecting Structure via pyvinecopulib...")
-    controls = pv.FitControlsVinecop(family_set=[pv.BicopFamily.gaussian, pv.BicopFamily.clayton, pv.BicopFamily.gumbel, pv.BicopFamily.student, pv.BicopFamily.frank])
-    structure = pv.Vinecop(d=N) 
-    structure.select(data_u, controls=controls)
-    print(f"   Structure: R-Vine with {len(structure.pair_copulas)} trees.")
-
-    print("3. Fitting Dynamic GAS Vine (Model 0)...")
-    paths = fit_mixed_gas_vine(data_u, structure)
-    
-    print("4. Plotting Results...")
-    keys = list(paths.keys())
-    plt.figure(figsize=(12, 6))
-    # Plot first edge of first tree
-    plt.plot(paths[keys[0]], label=f"Tree 1 Edge 1 ({keys[0]})")
-    # Plot last edge
-    plt.plot(paths[keys[-1]], label=f"Deep Edge ({keys[-1]})")
-    plt.title("Recovered Dynamic Dependence (GAS Parameters)")
-    plt.legend()
-    plt.show()
-
-    plot_vine_structure(structure, N)
-    
-    print("Done")
