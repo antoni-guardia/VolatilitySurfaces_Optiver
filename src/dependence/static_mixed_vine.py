@@ -1,4 +1,5 @@
 import pyvinecopulib as pv
+import os
 
 # Fits a Static Mixed R-Vine Copula to the data
 def fit_static_mixed_vine(u_data):
@@ -13,11 +14,14 @@ def fit_static_mixed_vine(u_data):
             pv.BicopFamily.frank,    # Symmetric Body Dependence (No tails)
             pv.BicopFamily.clayton,  # Lower Tail (Crashes)
             pv.BicopFamily.gumbel,   # Upper Tail (Rallies)
+            #pv.BicopFamily.bb1,      # Clayton-Gumbel Mix
+            #pv.BicopFamily.bb7       # Joe-Clayton Mix
         ],
-        selection_criterion="bic",
+        selection_criterion="aic",
         trunc_lvl=N-1,               # Fit full tree
         tree_criterion="tau",        # Use correlation to order the tree 
-        allow_rotations=True         # Enables negative correlations
+        allow_rotations=True,        # Enables negative correlations
+        num_threads=os.cpu_count()-1
     )
 
     model = pv.Vinecop(d=N)

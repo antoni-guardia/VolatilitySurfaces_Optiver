@@ -1,273 +1,370 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import pyvinecopulib as pv
+from scipy.special import stdtrit, stdtr
+from scipy.stats import kendalltau, norm
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from scipy.optimize import minimize
 
-# Bounds helper for copula families
-def get_parameter_bounds(family):
-    bounds = {
-        pv.BicopFamily.gaussian: (-0.9999, 0.9999),
-        pv.BicopFamily.student: (-0.9999, 0.9999),
-        pv.BicopFamily.clayton: (1e-4, 20.0),      # Must be > 0
-        pv.BicopFamily.gumbel: (1.0001, 20.0),     # Must be >= 1
-        pv.BicopFamily.frank: (-20.0, 20.0),       # Non-zero
-    }
-    return bounds.get(family, (-np.inf, np.inf))
+# Force Double Precision
+torch.set_default_dtype(torch.float64)
 
-# Robust parameter converter to ensure compatibility with pyvinecopulib's C++ backend
-def to_pv_params(theta, fixed_params):
-    th_val = float(theta)
-    p_list = [th_val]
+# ==========================================
+# 1. DIFFERENTIABLE MATH PRIMITIVES
+# ==========================================
 
-    if len(fixed_params) > 1:
-        for i in range(1, len(fixed_params)):
-            p_list.append(float(fixed_params[i]))
+class InverseStudentT(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, u, nu):
+        u_cpu = u.detach().cpu().numpy()
+        nu_cpu = nu.detach().cpu().numpy()
+        u_cpu = np.clip(u_cpu, 1e-12, 1 - 1e-12)
+        x = stdtrit(nu_cpu, u_cpu)
+        x_tensor = torch.from_numpy(x).to(u.device, dtype=u.dtype)
+        ctx.save_for_backward(x_tensor, u, nu)
+        return x_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, u, nu = ctx.saved_tensors
+        pi = torch.tensor(3.141592653589793, device=x.device, dtype=x.dtype)
+        
+        log_const = torch.lgamma((nu + 1) / 2) - torch.lgamma(nu / 2) - 0.5 * torch.log(nu * pi)
+        log_kernel = -((nu + 1) / 2) * torch.log(1 + (x**2) / nu)
+        pdf = torch.exp(log_const + log_kernel)
+        pdf = torch.clamp(pdf, min=1e-100)
+        grad_u = grad_output / pdf
+        
+        grad_nu = None
+        if ctx.needs_input_grad[1]:
+            eps = 1e-4
+            u_cpu = u.detach().cpu().numpy()
+            nu_p = (nu + eps).detach().cpu().numpy()
+            nu_m = (nu - eps).detach().cpu().numpy()
+            x_p = stdtrit(nu_p, u_cpu)
+            x_m = stdtrit(nu_m, u_cpu)
+            dx_dnu = torch.from_numpy((x_p - x_m) / (2 * eps)).to(x.device, dtype=x.dtype)
+            grad_nu = grad_output * dx_dnu
+        
+        return grad_u, grad_nu
+
+def inverse_t_cdf(u, nu):
+    return InverseStudentT.apply(u, nu)
+
+
+# ==========================================
+# 2. GAS PAIR COPULA CELL
+# ==========================================
+
+class GASPairCopula(nn.Module):
+    def __init__(self, family, rotation=0):
+        super().__init__()
+        self.family = str(family).split('.')[-1].lower()
+        self.rotation = int(rotation)
+        self.omega = nn.Parameter(torch.tensor(0.0))
+        self.A = nn.Parameter(torch.tensor(0.05)) 
+        self.B_logit = nn.Parameter(torch.tensor(3.0)) 
+
+        if 'student' in self.family:
+            self.nu_param = nn.Parameter(torch.tensor(2.0))
+        else:
+            self.register_parameter('nu_param', None)
+
+    def get_nu(self):
+        if self.nu_param is None: return None
+        return torch.nn.functional.softplus(self.nu_param) + 2.01
+    
+    def get_B(self):
+        return torch.sigmoid(self.B_logit)
+
+    def rotate_data(self, u, v):
+        if self.rotation == 90: return 1-u, v
+        if self.rotation == 180: return 1-u, 1-v
+        if self.rotation == 270: return u, 1-v
+        return u, v
+    
+    def transform_parameter(self, f_t):
+        if 'gaussian' in self.family or 'student' in self.family:
+            return torch.tanh(f_t) * 0.999
+        elif 'clayton' in self.family:
+            return torch.nn.functional.softplus(f_t) + 1e-5
+        elif 'gumbel' in self.family:
+            return torch.nn.functional.softplus(f_t) + 1.0001
+        elif 'frank' in self.family:
+            val = f_t 
+            mask = torch.abs(val) < 1e-4
+            val = torch.where(mask, torch.sign(val) * 1e-4, val)
+            return val
+        return f_t
+    
+    def warm_start(self, u_vec, v_vec):
+        if isinstance(u_vec, torch.Tensor):
+            u_vec = u_vec.detach().cpu().numpy()
+            v_vec = v_vec.detach().cpu().numpy()
             
-    return np.array([p_list], dtype=np.float64)
-
-# Maps the unbounded GAS factor 'f' to the valid parameter space 'theta'
-def transform_f_to_theta(f, family):
-    if family in [pv.BicopFamily.gaussian, pv.BicopFamily.student]:
-        return np.tanh(f) # Maps (-inf, inf) -> (-1, 1)
-    
-    elif family == pv.BicopFamily.clayton:
-        return np.exp(f) + 1e-4 # Maps to (0, inf)
-    
-    elif family in pv.BicopFamily.gumbel:
-        return np.exp(f) + 1.0001 # Maps to (1, inf)
-    
-    elif family == pv.BicopFamily.frank:
-        return f if abs(f) > 1e-4 else 1e-4
-             
-    return f
-
-#  Inverse mapping used to initialize 'f' from the Static model's parameter
-def inverse_transform_theta_to_f(theta, family):
-    th = float(theta)
-    if family in [pv.BicopFamily.gaussian, pv.BicopFamily.student]:
-        return np.arctanh(np.clip(th, -0.995, 0.995))
-    elif family == pv.BicopFamily.clayton:
-        return np.log(max(th, 1e-4))
-    elif family in pv.BicopFamily.gumbel:
-        return np.log(max(th - 1.001, 1e-4))
-    return th
-
-# Compute the Score (Gradient of Log-Likelihood) using a 5-Point Stencil for numerical differentiation
-def score(u, v, family, theta, fixed_params, rotation=0, epsilon=1e-5):
-    try:
-        def get_ll(th):
-            # Bounds Check
-            lb, ub = get_parameter_bounds(family)
-            if th <= lb or th >= ub: return -1e10
-
-            try:
-                params_arr = to_pv_params(th, fixed_params)
-                bc = pv.Bicop(family=family, parameters=params_arr, rotation=rotation)
-                ll = bc.loglik(np.column_stack([u, v]))
-                return -1e10 if (np.isnan(ll) or np.isinf(ll)) else ll
-            except RuntimeError:
-                return -1e10
-
-        # Richardson Extrapolation (5 points)
-        ll_p2 = get_ll(theta + 2*epsilon)
-        ll_p1 = get_ll(theta + 1*epsilon)
-        ll_m1 = get_ll(theta - 1*epsilon)
-        ll_m2 = get_ll(theta - 2*epsilon)
+        tau, _ = kendalltau(u_vec, v_vec)
+        if self.rotation in [90, 270]: tau = -tau
         
-        # Stability check
-        if ll_p1 <= -1e9 or ll_m1 <= -1e9: return 0.0
-        
-        grad = (-ll_p2 + 8*ll_p1 - 8*ll_m1 + ll_m2) / (12 * epsilon)
-        
-        # Clip gradients to prevent GAS explosion during shocks
-        return np.clip(grad, -50.0, 50.0)
-        
-    except:
-        return 0.0
+        f_init = 0.0
+        if 'gaussian' in self.family or 'student' in self.family:
+            theta = np.sin(tau * np.pi / 2)
+            f_init = np.arctanh(np.clip(theta, -0.99, 0.99))
+        elif 'clayton' in self.family:
+            theta = 2 * tau / (1 - tau) if tau < 1 else 0.1
+            f_init = np.log(np.exp(max(theta, 1e-4)) - 1)
+        elif 'gumbel' in self.family:
+            theta = 1 / (1 - tau) if tau < 1 else 1.1
+            f_init = np.log(np.exp(max(theta - 1.0, 1e-4)) - 1)
+        elif 'frank' in self.family:
+            f_init = 5 * tau 
 
-# Fits the GAS process for a single pair of variables
-def fit_gas_edge(u, v, family, rotation=0):
-    T = len(u)
-    
-    # Warm Start: Fit Static Copula to get initial parameters
-    bc_static = pv.Bicop(family=family, rotation=rotation)
-    bc_static.fit(np.column_stack([u, v]))
-    static_params = np.array(bc_static.parameters).flatten()
-    
-    # Initial theta and GAS Factors
-    theta_static = static_params[0]
-    f_init = inverse_transform_theta_to_f(theta_static, family)
+        with torch.no_grad():
+            self.omega.copy_(torch.tensor(f_init * (1 - 0.95)))
 
-    # Tune A and B
-    def objective(hyperparams):
-        A, B = hyperparams
-        
-        # Constraints: Stationarity (A + B < 1) and Positivity (A > 0, B > 0) 
-        if A <= 0.001 or B <= 0.001: return 1e12
-        if A + B >= 0.999: return 1e12
-        
-        # omega = f_long_run * (1 - B) - A * expectation_of_score can be simplified to omega = f_init * (1 - B) 
-        omega = f_init * (1 - B)
+    def log_likelihood_pair(self, u, v, theta, nu=None):
+        u_rot, v_rot = self.rotate_data(u, v)
+        eps = 1e-9
+        u_rot = torch.clamp(u_rot, eps, 1 - eps)
+        v_rot = torch.clamp(v_rot, eps, 1 - eps)
 
-        f_t = f_init
-        total_nll = 0.0
+        if 'gaussian' in self.family:
+            rho = theta
+            n = torch.distributions.Normal(0, 1)
+            x, y = n.icdf(u_rot), n.icdf(v_rot)
+            z = x**2 + y**2 - 2*rho*x*y
+            log_det = 0.5 * torch.log(1 - rho**2 + 1e-8)
+            log_exp = -0.5 * (z / (1 - rho**2 + 1e-8) - (x**2 + y**2))
+            return -log_det + log_exp
+
+        elif 'student' in self.family:
+            rho = theta
+            x = inverse_t_cdf(u_rot, nu)
+            y = inverse_t_cdf(v_rot, nu)
+            zeta = (x**2 + y**2 - 2*rho*x*y) / (1 - rho**2)
+            term1 = -((nu + 2)/2) * torch.log(1 + zeta/nu)
+            term2 = ((nu + 1)/2) * (torch.log(1 + x**2/nu) + torch.log(1 + y**2/nu))
+            log_det = 0.5 * torch.log(1 - rho**2)
+            lgamma = torch.lgamma
+            const = lgamma((nu + 2)/2) + lgamma(nu/2) - 2*lgamma((nu+1)/2)
+            return const - log_det + term1 + term2
+
+        elif 'clayton' in self.family:
+            t = theta
+            a = torch.log(1 + t) - (1 + t) * (torch.log(u_rot) + torch.log(v_rot))
+            b = torch.pow(u_rot, -t) + torch.pow(v_rot, -t) - 1
+            return a - (2 + 1/t) * torch.log(torch.clamp(b, min=eps))
+
+        elif 'gumbel' in self.family:
+            t = theta
+            # FIX: Separate lines to avoid unpacking error
+            x = -torch.log(u_rot)
+            y = -torch.log(v_rot)
+            
+            A = torch.pow(x**t + y**t, 1/t)
+            term1 = torch.log(A + t - 1)
+            term2 = -A
+            term3 = (t - 1) * (torch.log(x) + torch.log(y))
+            term4 = (1/t - 2) * torch.log(x**t + y**t)
+            jacobian = -torch.log(u_rot) - torch.log(v_rot)
+            return term1 + term2 + term3 + term4 + jacobian
+        
+        elif 'frank' in self.family:
+            t = theta
+            exp_t = torch.exp(-t)
+            exp_tu = torch.exp(-t * u_rot)
+            exp_tv = torch.exp(-t * v_rot)
+            log_num = torch.log(torch.abs(t) + eps) + torch.log(torch.abs(1 - exp_t) + eps) - t*(u_rot + v_rot)
+            denom_inner = (1 - exp_t) - (1 - exp_tu) * (1 - exp_tv)
+            log_denom = 2.0 * torch.log(torch.abs(denom_inner) + eps)
+            return log_num - log_denom
+        
+        return torch.zeros_like(u)
+
+    def compute_h_func(self, u, v, theta, nu=None):
+        u_rot, v_rot = self.rotate_data(u, v)
+        eps = 1e-9
+        u_rot = torch.clamp(u_rot, eps, 1-eps)
+        v_rot = torch.clamp(v_rot, eps, 1-eps)
+        h_val = torch.zeros_like(u_rot)
+        
+        if 'gaussian' in self.family:
+            n = torch.distributions.Normal(0, 1)
+            x, y = n.icdf(u_rot), n.icdf(v_rot)
+            h_val = n.cdf((x - theta*y) / torch.sqrt(1 - theta**2))
+
+        elif 'student' in self.family:
+            x = inverse_t_cdf(u_rot, nu)
+            y = inverse_t_cdf(v_rot, nu)
+            factor = torch.sqrt((nu + 1) / (nu + y**2) / (1 - theta**2))
+            arg = (x - theta * y) * factor
+            h_val = torch.tensor(stdtr((nu+1).detach().cpu().numpy(), arg.detach().cpu().numpy()))
+
+        elif 'clayton' in self.family:
+            t = theta
+            term = torch.pow(v_rot, -t-1) * torch.pow(torch.pow(u_rot, -t) + torch.pow(v_rot, -t) - 1, -1/t - 1)
+            h_val = term
+
+        elif 'gumbel' in self.family:
+            t = theta
+            # FIX: Separate lines here too
+            x = -torch.log(u_rot)
+            y = -torch.log(v_rot)
+            
+            A = torch.pow(x**t + y**t, 1/t)
+            h_val = torch.exp(-A) * torch.pow(y, t-1) / v_rot * torch.pow(x**t + y**t, 1/t - 1)
+        
+        elif 'frank' in self.family:
+            t = theta
+            et = torch.exp(-t); eu = torch.exp(-t*u_rot); ev = torch.exp(-t*v_rot)
+            num = (eu - 1) * ev
+            den = (et - 1) + (eu - 1) * (ev - 1)
+            h_val = num / (den + 1e-20)
+
+        if self.rotation in [90, 270]: h_val = 1 - h_val
+        return torch.clamp(h_val, eps, 1 - eps)
+
+    def forward(self, u_data, v_data):
+        T = u_data.shape[0]
+        f_t = self.omega.clone()
+        B = self.get_B()
+        nu = self.get_nu()
+        score_variance = torch.tensor(1.0)
+        alpha = 0.99 
+        
+        log_likes = []
+        thetas = []
+        
         for t in range(T):
-            theta_t = transform_f_to_theta(f_t, family)
+            theta_t = self.transform_parameter(f_t)
+            thetas.append(theta_t)
             
-            # Bounds check
-            lb, ub = get_parameter_bounds(family)
-            if theta_t <= lb + 1e-4 or theta_t >= ub - 1e-4:
-                total_nll += 1e6
-                # Mean reversion if out of bounds
-                f_t = omega + A * 0 + B * f_t 
-                continue
-
-            # Log Likelihood
-            try:
-                params = to_pv_params(theta_t, static_params)
-                bc = pv.Bicop(family=family, parameters=params, rotation=rotation)
-                ll = bc.loglik(np.column_stack([u[t], v[t]]))
-                if np.isnan(ll) or np.isinf(ll):
-                    total_nll += 1e6
-                else:
-                    total_nll -= ll
-            except:
-                total_nll += 1e6
+            f_t_leaf = f_t.detach().requires_grad_(True)
+            theta_leaf = self.transform_parameter(f_t_leaf)
+            u_t = u_data[t:t+1]
+            v_t = v_data[t:t+1]
             
-            # Update Score
-            st = score(np.array([u[t]]), np.array([v[t]]), family, theta_t, static_params, rotation)
-            f_t = omega + A * st + B * f_t
+            ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu)
             
-        return total_nll
+            # Autograd.grad is essential for GAS score
+            score = torch.autograd.grad(ll, f_t_leaf, create_graph=False)[0]
 
-    best_res = None
-    best_fun = 1e20
-    guesses = [[0.05, 0.90], [0.02, 0.97], [0.1, 0.8]]
-
-    for guess in guesses:
-        res = minimize(objective, guess, method='Nelder-Mead', tol=1e-2)
-        if res.fun < best_fun:
-            best_fun = res.fun
-            best_res = res
+            with torch.no_grad():
+                score_val = score.item()
+                score_variance = alpha * score_variance + (1 - alpha) * (score_val**2)
+                scale = 1.0 / (torch.sqrt(score_variance) + 1e-8)
             
-    best_A, best_B = best_res.x
+            scaled_score = score.detach() * scale
+            f_next = self.omega + self.A * scaled_score + B * f_t
+            
+            ll_connected = self.log_likelihood_pair(u_t, v_t, theta_t, nu)
+            log_likes.append(ll_connected)
+            f_t = f_next
+            
+        return -torch.sum(torch.stack(log_likes)), torch.stack(thetas)
 
-    msg = f"Optimized Edge ({family}): A={best_A:.3f}, B={best_B:.3f}"
-    tqdm.write(msg)
 
-    # Final Run with Best Params to generate path
-    omega_best = f_init * (1 - best_B)
-    theta_path = np.zeros(T)
-    f_t = f_init
+# ==========================================
+# 3. VINE FITTER ENGINE
+# ==========================================
+
+def fit_mixed_gas_vine(u_matrix, structure):
+    T, N = u_matrix.shape
+    device = torch.device("cpu") 
+    print(f"Fitting GAS Vine on {device}...")
+    u_tensor = torch.tensor(u_matrix, dtype=torch.float64).to(device)
     
-    for t in range(T):
-        theta_t = transform_f_to_theta(f_t, family)
-        theta_path[t] = theta_t
-        st = score(np.array([u[t]]), np.array([v[t]]), family, theta_t, static_params, rotation)
-        f_t = omega_best + best_A * st + best_B * f_t
-        
-    return theta_path, static_params
-
-# Fits the Mixed GAS Vine
-def fit_gas_vine(u_data, static_model):
-    T, N = u_data.shape
-    M = np.array(static_model.matrix)
+    # --- ROBUST MATRIX PROCESSOR ---
+    M = np.array(structure.matrix, dtype=np.int64)
+    # Fix 1: 1-based indexing check
+    if M.max() == N:
+        M -= 1 
     
-    # Orient Matrix to Lower Triangular if needed
-    top_nonzeros = np.count_nonzero(M[0, :])
-    bot_nonzeros = np.count_nonzero(M[N-1, :])
-    if top_nonzeros > bot_nonzeros:
-        M = np.flip(M).T # Standardize orientation
-        print(">> Re-oriented Matrix.")
-
-    dynamic_results = {}
-    tree_outputs = { -1: {} }
+    # Fix 2: Flip check (Top-Heavy to Bottom-Heavy)
+    top_density = np.sum(M[0] >= 0)
+    bot_density = np.sum(M[-1] >= 0)
+    if top_density > bot_density:
+        M = np.flipud(M)
+    # -------------------------------
     
-    # Init Tree -1 (Raw Data)
+    fams = structure.pair_copulas
+    h_storage = {} 
+    
+    # Initialize Tree -1 (Raw Data)
     for i in range(N):
-        tree_outputs[-1][i] = {
-            'direct_var': i,
-            'direct_h': u_data[:, i],
-            'indirect_var': i,
-            'indirect_h': u_data[:, i]
-        }
-        
-    print(f"Fitting GAS Vine on {N} assets (T={T})...")
+        h_storage[(i, -1)] = u_tensor[:, i]
+
+    fitted_models = {}
     
     for tree in range(N - 1):
-        tree_outputs[tree] = {}
-        pbar = tqdm(range(N - 1 - tree), desc=f"Tree {tree+1}")
+        edges = N - 1 - tree
+        pbar = tqdm(range(edges), desc=f"Tree {tree+1}/{N-1}")
         
-        for edge_col in pbar:
-
-            row_idx = N - 1 - tree
-            a_idx = int(M[row_idx, edge_col]) - 1
-            b_idx = int(M[edge_col, edge_col]) - 1
+        for edge in pbar:
+            row = N - 1 - tree 
+            col = edge
             
-            prev_level = tree_outputs[tree - 1]
-            u_vec = None
-            v_vec = None
+            var_1 = M[row, col]
+            u_vec = h_storage[(var_1, -1)] if tree == 0 else h_storage[(col, tree-1)]
             
-            # Search helper
-            def find_input(target_var, prev_outputs):
-                for k, out in prev_outputs.items():
-                    if out['direct_var'] == target_var:
-                        return out['direct_h']
-                    if out['indirect_var'] == target_var:
-                        return out['indirect_h']
-                return None
-            
+            var_2 = M[col, col]
+            partner_col = -1
             if tree == 0:
-                u_vec = u_data[:, a_idx]
-                v_vec = u_data[:, b_idx]
+                v_vec = h_storage[(var_2, -1)]
             else:
-                u_vec = find_input(a_idx, prev_level)
-                v_vec = find_input(b_idx, prev_level)
+                for k in range(N):
+                    # Robust search against padding (-1)
+                    if M[row+1, k] == var_2:
+                        partner_col = k; break
+                v_vec = h_storage[(partner_col, tree-1)]
 
-            if u_vec is None or v_vec is None:
-                continue
+            # Stability
+            u_vec = torch.nan_to_num(u_vec, 0.5)
+            v_vec = torch.nan_to_num(v_vec, 0.5)
 
-            pc = static_model.pair_copulas[tree][edge_col]
-            fam, rot = pc.family, pc.rotation
-            
-            if fam == pv.BicopFamily.indep:
-                theta_path = np.zeros(T)
-                h_a_next = u_vec
-                h_b_next = v_vec
+            pc = fams[tree][edge]
+            fam_str = str(pc.family)
+
+            if 'indep' in fam_str.lower():
+                h_direct = u_vec; h_indirect = v_vec
+                fitted_models[f"T{tree}_E{edge}"] = {'path': np.zeros(T), 'family': 'indep'}
             else:
-                theta_path, fixed_params = fit_gas_edge(u_vec, v_vec, fam, rot)
+                model = GASPairCopula(fam_str, rotation=pc.rotation).to(device)
+                model.warm_start(u_vec, v_vec)
                 
-                h_a_next = np.zeros(T)
-                h_b_next = np.zeros(T)
+                optimizer = optim.Adam(model.parameters(), lr=0.02)
+                loss_hist = []
+
+                # Optimization
+                for _ in range(30):
+                    optimizer.zero_grad()
+                    loss, _ = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
+                    if torch.isnan(loss): break
+                    loss.backward()
+                    optimizer.step()
+                    loss_hist.append(loss.item())
                 
-                for t in range(T):
-                    try:
-                        p_arr = to_pv_params(theta_path[t], fixed_params)
-                        bc_t = pv.Bicop(family=fam, parameters=p_arr, rotation=rot)
-                        
-                        pt = np.array([[u_vec[t], v_vec[t]]])
+                # Path Extraction (CRITICAL: NO torch.no_grad() here)
+                # GAS forward pass requires autograd for the scores
+                _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
+                theta_path = theta_path.detach() # Detach AFTER computation
+                
+                nu_val = model.get_nu()
+                if nu_val is not None: nu_val = nu_val.detach()
+                    
+                h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
+                h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
+                
+                fitted_models[f"T{tree}_E{edge}"] = {
+                    'loss_history': loss_hist,
+                    'path': theta_path.numpy(),
+                    'family': fam_str,
+                    'rotation': pc.rotation
+                }
 
-                        h_a_next[t] = bc_t.hfunc2(pt).item()
-                        h_b_next[t] = bc_t.hfunc1(pt).item()
-                        
-                    except:
-                        h_a_next[t] = u_vec[t]
-                        h_b_next[t] = v_vec[t]
+            h_storage[(col, tree)] = h_direct
+            if tree < N - 2: h_storage[(partner_col, tree)] = h_indirect
+                
+    return fitted_models
 
-            # Store for next tree
-            tree_outputs[tree][edge_col] = {
-                'direct_var': a_idx,
-                'direct_h': h_a_next,  
-                'indirect_var': b_idx,
-                'indirect_h': h_b_next  
-            }
-            
-            key = f"T{tree}_{a_idx}-{b_idx}"
-            dynamic_results[key] = {
-                'theta': theta_path,
-                'family': str(fam).split('.')[-1],
-                'rotation': rot
-            }
-
-    return dynamic_results
+if __name__ == "__main__":
+    print("Mixed Dynamic Vine Module Loaded. (Final Fixed Version)")
