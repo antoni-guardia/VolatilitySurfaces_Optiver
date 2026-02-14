@@ -61,9 +61,6 @@ class NGARCH_T:
         self.params = res.x
         mu, omega, alpha, beta, theta, nu = self.params
         
-        print(f"mu={mu:.4f}, omega={omega:.6f}, alpha={alpha:.4f}, beta={beta:.4f}, "
-              f"theta={theta:.4f}, nu={nu:.2f}, LL={-res.fun:.2f}")
-        
         self.vol = self._garch_vol(r, mu, omega, alpha, beta, theta)
         self.resids = (r - mu) / self.vol
         
@@ -138,28 +135,33 @@ class NGARCH_T:
         ax6.set_title('Q-Q Uniform')
         ax6.grid(alpha=0.3)
         
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.subplots_adjust(top=0.93, bottom=0.07, left=0.07, right=0.93, hspace=0.5, wspace=0.3)
         if save:
             plt.savefig(save, dpi=300, bbox_inches='tight')
         return fig
 
 
 if __name__ == "__main__":
-    base = os.path.dirname(os.path.abspath(__file__))
-    data_path = os.path.join(base, "..", "..", "..", "data", "processed", "returns.csv")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+
+    script_dir = os.path.join(project_root, "data", "processed")
+    data_path = os.path.join(script_dir, "returns.csv")
+
+    res_dir = os.path.join(project_root, "outputs", "dynamics")
+    os.makedirs(res_dir, exist_ok=True)
+        
+    diag_dir = os.path.join(res_dir, "plots", "ngarch")
+    os.makedirs(diag_dir, exist_ok=True)
     
     df = pd.read_csv(data_path, index_col=0).apply(pd.to_numeric, errors='coerce')
     print(f"Shape: {df.shape}, Assets: {df.columns.tolist()}\n")
     
     models = {}
     uniforms = {}
+    params = []
     
-    diag_dir = os.path.join(base, "..", "..", "..", "data", "results", "ngarch")
-    os.makedirs(diag_dir, exist_ok=True)
-    
-    for col in df.columns:
-        print(f"\n{'='*60}\n{col}\n{'='*60}")
-        
+    for col in df.columns:        
         m = NGARCH_T()
         m.fit(df[col].dropna())
         
@@ -168,21 +170,16 @@ if __name__ == "__main__":
         
         m.diagnostics(name=col, save=os.path.join(diag_dir, f"{col}_diag.png"))
         plt.close()
-    
-    u_df = pd.DataFrame(uniforms)
-    print(f"\n\nUniforms:\n{u_df.describe()}")
-    
-    res_dir = os.path.join(base, "..", "..", "..", "data", "results")
-    u_df.to_csv(os.path.join(res_dir, "uniforms_ngarch_t.csv"))
-    
-    params = []
-    for col in df.columns:
+
         mu, omega, alpha, beta, theta, nu = models[col].params
         params.append({
             'asset': col, 'mu': mu, 'omega': omega, 'alpha': alpha,
             'beta': beta, 'theta': theta, 'nu': nu, 'persistence': alpha + beta
         })
     
+    u_df = pd.DataFrame(uniforms)
+    u_df.to_csv(os.path.join(res_dir, "uniforms_ngarch_t.csv"))
+
     p_df = pd.DataFrame(params)
     p_df.to_csv(os.path.join(res_dir, "ngarch_t_params.csv"), index=False)
     

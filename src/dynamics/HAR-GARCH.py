@@ -60,7 +60,7 @@ class HAR_GARCH_EVT:
             pred_mean = har_model.predict(X)
             residuals = Y - pred_mean
             
-            garch = arch_model(residuals, vol='GARCH', p=1, q=1, mean='Zero', dist='normal')
+            garch = arch_model(residuals, vol='GARCH', p=1, q=1, mean='Zero', dist='normal', rescale=True)
             garch_res = garch.fit(disp='off', show_warning=False)
             
             cond_vol = garch_res.conditional_volatility
@@ -80,14 +80,14 @@ class HAR_GARCH_EVT:
             'loglikelihood': garch_res.loglikelihood
         }
         
-        print(f"HAR: intercept={self.params['har_intercept']:.4f}, "
-              f"daily={self.params['har_daily']:.4f}, "
-              f"weekly={self.params['har_weekly']:.4f}, "
-              f"monthly={self.params['har_monthly']:.4f}")
-        print(f"GARCH: omega={self.params['garch_omega']:.6f}, "
-              f"alpha={self.params['garch_alpha']:.4f}, "
-              f"beta={self.params['garch_beta']:.4f}, "
-              f"LL={self.params['loglikelihood']:.2f}")
+        # print(f"HAR: intercept={self.params['har_intercept']:.4f}, "
+        #       f"daily={self.params['har_daily']:.4f}, "
+        #       f"weekly={self.params['har_weekly']:.4f}, "
+        #       f"monthly={self.params['har_monthly']:.4f}")
+        # print(f"GARCH: omega={self.params['garch_omega']:.6f}, "
+        #       f"alpha={self.params['garch_alpha']:.4f}, "
+        #       f"beta={self.params['garch_beta']:.4f}, "
+        #       f"LL={self.params['loglikelihood']:.2f}")
         
         self.vol = garch_res.conditional_volatility
         self.resids = residuals / self.vol
@@ -95,9 +95,7 @@ class HAR_GARCH_EVT:
         evt = EVT()
         evt.fit(self.resids, lower_quantile=0.10, upper_quantile=0.10)
         self.evt_model = evt
-        
-        print(f"EVT: u_lower={evt.u_lower:.4f}, u_upper={evt.u_upper:.4f}")
-        
+                
         u = evt.transform(self.resids)
         self.uniforms = pd.Series(u, index=valid_idx) if valid_idx is not None else u
         
@@ -122,7 +120,7 @@ class HAR_GARCH_EVT:
                     'b-', lw=1, alpha=0.7, label='HAR Fitted')
             ax0.plot(self.uniforms.index, 
                     self.uniforms.index.map(dict(zip(actual, fitted + self.resids * self.vol))),
-                    'gray', lw=0.5, alpha=0.5, label='Actual')
+                    'red', lw=0.5, alpha=0.5, label='Actual')
         ax0.set_title('HAR Model Fit')
         ax0.legend()
         ax0.grid(alpha=0.3)
@@ -183,55 +181,53 @@ class HAR_GARCH_EVT:
         ax7.set_title('Q-Q Uniform')
         ax7.grid(alpha=0.3)
         
-        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        plt.subplots_adjust(top=0.93, bottom=0.07, left=0.07, right=0.93, hspace=0.5, wspace=0.3)
         if save:
             plt.savefig(save, dpi=300, bbox_inches='tight')
         return fig
 
 
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(script_dir, "all_factors.csv")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+
+    script_dir = os.path.join(project_root, "outputs", "factors")
+    file_path = os.path.join(script_dir, "factors.csv")
+
+    res_dir = os.path.join(project_root, "outputs", "dynamics")
+    os.makedirs(res_dir, exist_ok=True)
+        
+    diag_dir = os.path.join(res_dir, "plots", "HAR-GARCH-EVT")
+    os.makedirs(diag_dir, exist_ok=True)
     
     if os.path.exists(file_path):
         df = pd.read_csv(file_path, index_col=0).apply(pd.to_numeric, errors='coerce')
-        print(f"Shape: {df.shape}, Factors: {df.columns.tolist()}\n")
+        print(f"Processing {df.shape[1]} factors from {file_path}...\n")
         
         models = {}
         uniforms = {}
-        
-        diag_dir = os.path.join(script_dir, "..", "..", "..", "data", "results", "har_garch_evt")
-        os.makedirs(diag_dir, exist_ok=True)
+        params = []
         
         for col in df.columns:
-            print(f"\n{'='*60}\n{col}\n{'='*60}")
-            
+            print(f"\nFitting: {col}")
             m = HAR_GARCH_EVT(use_iterative_wls=True, max_iter=3)
             m.fit(df[col].dropna())
             
             models[col] = m
             uniforms[col] = m.uniforms
-            
             m.diagnostics(name=col, save=os.path.join(diag_dir, f"{col}_diag.png"))
             plt.close()
-        
-        u_df = pd.DataFrame(uniforms)
-        print(f"\n\nUniforms:\n{u_df.describe()}")
-        
-        res_dir = os.path.join(script_dir, "..", "..", "..", "data", "results")
-        u_df.to_csv(os.path.join(res_dir, "uniforms_har_garch_evt.csv"))
-        
-        params = []
-        for col in df.columns:
-            p = models[col].params.copy()
+
+            p = m.params.copy()
             p['factor'] = col
             p['persistence'] = p['garch_alpha'] + p['garch_beta']
             params.append(p)
         
+        u_df = pd.DataFrame(uniforms)
+        u_df.to_csv(os.path.join(res_dir, "uniforms_har_garch_evt.csv"))
+        
         p_df = pd.DataFrame(params)
         p_df.to_csv(os.path.join(res_dir, "har_garch_evt_params.csv"), index=False)
         
-        print(f"\n\nParameters:\n{p_df[['factor', 'har_daily', 'har_weekly', 'har_monthly', 'garch_alpha', 'garch_beta', 'persistence']]}")
     else:
-        print(f"Data file not found at {file_path}")
-        print("Please provide the correct path to factor_scores.csv")
+        print(f"Error: Could not find factors.csv at {file_path}")
