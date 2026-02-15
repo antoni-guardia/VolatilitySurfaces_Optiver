@@ -17,117 +17,115 @@ class HAR_GARCH_EVT:
         self.garch_model = None
         self.evt_model = None
         self.params = {}
-        self.uniforms = None
-        self.resids = None
-        self.vol = None
-        self.har_features = None
         
-    def _compute_har_features(self, series):
+        self.train_uniforms = None
+        self.test_uniforms = None
+        self.resids = None 
+        self.test_resids = None
+        self.vol = None
+        self.test_vol = None
+        self.har_features = None 
+        self.test_har_features = None
+    
+    def fit_and_predict(self, series, holdout_days=248):
         s = pd.Series(series)
         
+        # Feature Engineering
         avg_daily = s
         avg_weekly = s.rolling(window=5, min_periods=5).mean()
         avg_monthly = s.rolling(window=22, min_periods=22).mean()
         
-        feat_d = avg_daily.shift(1)
-        feat_w = avg_weekly.shift(1)
-        feat_m = avg_monthly.shift(1)
-        
-        df_feats = pd.concat([feat_d, feat_w, feat_m], axis=1)
+        df_feats = pd.concat([avg_daily.shift(1), avg_weekly.shift(1), avg_monthly.shift(1)], axis=1)
         df_feats.columns = ['daily', 'weekly', 'monthly']
-        
         df_combined = pd.concat([df_feats, s.rename('target')], axis=1).dropna()
-        
-        X = df_combined[['daily', 'weekly', 'monthly']].values
-        Y = df_combined['target'].values
-        valid_idx = df_combined.index
-        
-        return X, Y, valid_idx
-    
-    def fit(self, returns):
-        r = returns.values if isinstance(returns, pd.Series) else np.array(returns)
-        idx = returns.index if isinstance(returns, pd.Series) else None
-        
-        X, Y, valid_idx = self._compute_har_features(r if idx is None else pd.Series(r, index=idx))
-        
-        weights = np.ones(len(Y))
+                
+        X_full = df_combined[['daily', 'weekly', 'monthly']].values
+        Y_full = df_combined['target'].values
+        idx_full = df_combined.index
+
+        X_train, Y_train, idx_train = X_full[:-holdout_days], Y_full[:-holdout_days], idx_full[:-holdout_days]
+        X_test, Y_test, idx_test = X_full[-holdout_days:], Y_full[-holdout_days:], idx_full[-holdout_days:]
+
+        # Fit HAR
+        weights = np.ones(len(Y_train))
         iterations = self.max_iter if self.use_iterative_wls else 1
-        
-        for iteration in range(iterations):
+        for _ in range(iterations):
             har_model = LinearRegression()
-            har_model.fit(X, Y, sample_weight=weights)
+            har_model.fit(X_train, Y_train, sample_weight=weights)
+            res_train = Y_train - har_model.predict(X_train)
             
-            pred_mean = har_model.predict(X)
-            residuals = Y - pred_mean
-            
-            garch = arch_model(residuals, vol='GARCH', p=1, q=1, mean='Zero', dist='normal', rescale=True)
+            garch = arch_model(res_train, vol='GARCH', p=1, q=1, mean='Zero', dist='normal', rescale=True)
             garch_res = garch.fit(disp='off', show_warning=False)
-            
-            cond_vol = garch_res.conditional_volatility
-            weights = 1.0 / (cond_vol**2 + 1e-6)
+            weights = 1.0 / (garch_res.conditional_volatility**2 + 1e-6)
         
         self.har_model = har_model
         self.garch_model = garch_res
-        
         self.params = {
-            'har_intercept': har_model.intercept_,
-            'har_daily': har_model.coef_[0],
-            'har_weekly': har_model.coef_[1],
-            'har_monthly': har_model.coef_[2],
-            'garch_omega': garch_res.params['omega'],
-            'garch_alpha': garch_res.params['alpha[1]'],
-            'garch_beta': garch_res.params['beta[1]'],
-            'loglikelihood': garch_res.loglikelihood
+            'har_intercept': har_model.intercept_, 'har_daily': har_model.coef_[0],
+            'har_weekly': har_model.coef_[1], 'har_monthly': har_model.coef_[2],
+            'garch_omega': garch_res.params['omega'], 'garch_alpha': garch_res.params['alpha[1]'],
+            'garch_beta': garch_res.params['beta[1]'], 'loglikelihood': garch_res.loglikelihood
         }
+
+        # OOS + Filtering
+        res_test = Y_test - har_model.predict(X_test)
+        res_full = np.concatenate([res_train, res_test])
+
+        omega, alpha, beta = self.params['garch_omega'], self.params['garch_alpha'], self.params['garch_beta']
+        vol_full = np.zeros(len(res_full))
+        vol_full[0] = np.var(res_train)
+        for t in range(1, len(res_full)):
+            vol_full[t] = omega + alpha * res_full[t-1]**2 + beta * vol_full[t-1]
+        vol_full = np.sqrt(vol_full)
         
-        # print(f"HAR: intercept={self.params['har_intercept']:.4f}, "
-        #       f"daily={self.params['har_daily']:.4f}, "
-        #       f"weekly={self.params['har_weekly']:.4f}, "
-        #       f"monthly={self.params['har_monthly']:.4f}")
-        # print(f"GARCH: omega={self.params['garch_omega']:.6f}, "
-        #       f"alpha={self.params['garch_alpha']:.4f}, "
-        #       f"beta={self.params['garch_beta']:.4f}, "
-        #       f"LL={self.params['loglikelihood']:.2f}")
+        z_train = res_train / vol_full[:-holdout_days]
+        z_test = res_test / vol_full[-holdout_days:]
         
-        self.vol = garch_res.conditional_volatility
-        self.resids = residuals / self.vol
-        
+        # EVT
         evt = EVT()
-        evt.fit(self.resids, lower_quantile=0.10, upper_quantile=0.10)
+        evt.fit(z_train, lower_quantile=0.10, upper_quantile=0.10)
         self.evt_model = evt
                 
-        u = evt.transform(self.resids)
-        self.uniforms = pd.Series(u, index=valid_idx) if valid_idx is not None else u
+        self.train_uniforms = pd.Series(evt.transform(z_train), index=idx_train)
+        self.test_uniforms = pd.Series(evt.transform(z_test), index=idx_test)
         
-        self.har_features = pd.DataFrame(X, columns=['daily', 'weekly', 'monthly'], index=valid_idx)
+        self.resids = z_train
+        self.test_resids = z_test
+        self.vol = vol_full[:-holdout_days]
+        self.test_vol = vol_full[-holdout_days:]
+        self.har_features = pd.DataFrame(X_train, columns=['daily', 'weekly', 'monthly'], index=idx_train)
+        self.test_har_features = pd.DataFrame(X_test, columns=['daily', 'weekly', 'monthly'], index=idx_test)
         
         return self
     
-    def diagnostics(self, name="Factor", save=None):
-        z = self.resids
-        u = self.uniforms.values if isinstance(self.uniforms, pd.Series) else self.uniforms
+    def diagnostics(self, name="Factor", is_test=False, save=None):
+        # Swap between Train and Test data
+        z = self.test_resids if is_test else self.resids
+        u_series = self.test_uniforms if is_test else self.train_uniforms
+        u = u_series.values
+        features = self.test_har_features if is_test else self.har_features
+        vol_series = self.test_vol if is_test else self.vol
+        
+        phase = "Out-of-Sample (Test)" if is_test else "In-Sample (Train)"
         
         fig = plt.figure(figsize=(16, 14))
         gs = fig.add_gridspec(4, 3, hspace=0.35, wspace=0.3)
-        fig.suptitle(f'HAR-GARCH-EVT Diagnostics: {name}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'HAR-GARCH-EVT Diagnostics [{phase}]: {name}', fontsize=16, fontweight='bold')
         
         # 1. HAR fitted values vs actual
         ax0 = fig.add_subplot(gs[0, :])
-        actual = self.har_features.index
-        fitted = self.har_model.predict(self.har_features.values)
-        if isinstance(self.uniforms, pd.Series):
-            ax0.plot(self.uniforms.index, self.uniforms.index.map(dict(zip(actual, fitted))), 
-                    'b-', lw=1, alpha=0.7, label='HAR Fitted')
-            ax0.plot(self.uniforms.index, 
-                    self.uniforms.index.map(dict(zip(actual, fitted + self.resids * self.vol))),
-                    'red', lw=0.5, alpha=0.5, label='Actual')
+        fitted = self.har_model.predict(features.values)
+        actual = fitted + z * vol_series
+        
+        ax0.plot(u_series.index, fitted, 'b-', lw=1, alpha=0.7, label='HAR Fitted')
+        ax0.plot(u_series.index, actual, 'red', lw=0.5, alpha=0.5, label='Actual')
         ax0.set_title('HAR Model Fit')
         ax0.legend()
         ax0.grid(alpha=0.3)
         
         # 2. Standardized residuals time series
         ax1 = fig.add_subplot(gs[1, :])
-        ax1.plot(z, lw=0.5, alpha=0.7)
+        ax1.plot(u_series.index, z, lw=0.5, alpha=0.7)
         ax1.axhline(0, color='r', ls='--', lw=0.8)
         ax1.axhline(2, color='orange', ls=':', lw=0.8)
         ax1.axhline(-2, color='orange', ls=':', lw=0.8)
@@ -139,8 +137,7 @@ class HAR_GARCH_EVT:
         ax2.hist(z, bins=50, density=True, alpha=0.6, color='steelblue', ec='black')
         x_range = np.linspace(z.min(), z.max(), 200)
         ax2.plot(x_range, norm.pdf(x_range), 'r--', lw=2, label='N(0,1)')
-        ax2.axvline(self.evt_model.u_lower, color='orange', ls='--', lw=1.5, 
-                   label='EVT thresholds')
+        ax2.axvline(self.evt_model.u_lower, color='orange', ls='--', lw=1.5, label='EVT thresholds')
         ax2.axvline(self.evt_model.u_upper, color='orange', ls='--', lw=1.5)
         ax2.set_title('Distribution with EVT Thresholds')
         ax2.legend()
@@ -186,52 +183,47 @@ class HAR_GARCH_EVT:
             plt.savefig(save, dpi=300, bbox_inches='tight')
         return fig
 
-
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
-    script_dir = os.path.join(project_root, "outputs", "factors")
-    file_path = os.path.join(script_dir, "factors.csv")
-
+    file_path = os.path.join(project_root, "outputs", "factors", "factors.csv")
     res_dir = os.path.join(project_root, "outputs", "dynamics")
-    os.makedirs(res_dir, exist_ok=True)
-        
     diag_dir = os.path.join(res_dir, "plots", "HAR-GARCH-EVT")
     os.makedirs(diag_dir, exist_ok=True)
     
+    HOLDOUT_DAYS = 248 # 1 Year Split
+
     if os.path.exists(file_path):
-        df = pd.read_csv(file_path, index_col=0).apply(pd.to_numeric, errors='coerce')
-        print(f"Processing {df.shape[1]} factors from {file_path}...\n")
+        df = pd.read_csv(file_path, index_col=0, parse_dates=True).apply(pd.to_numeric, errors='coerce')
+        print(f"Processing {df.shape[1]} factors. Holdout: {HOLDOUT_DAYS} days...\n")
         
-        models = {}
-        uniforms = {}
-        params = []
+        models, train_u, test_u, params = {}, {}, {}, []
         
         for col in df.columns:
-            print(f"\nFitting: {col}")
+            print(f"Fitting: {col}")
             m = HAR_GARCH_EVT(use_iterative_wls=True, max_iter=3)
-            m.fit(df[col].dropna())
+            m.fit_and_predict(df[col].dropna(), holdout_days=HOLDOUT_DAYS)
             
-            models[col] = m
-            uniforms[col] = m.uniforms
-            m.diagnostics(name=col, save=os.path.join(diag_dir, f"{col}_diag.png"))
-            plt.close()
+            train_u[col] = m.train_uniforms
+            test_u[col] = m.test_uniforms
+            
+            m.diagnostics(name=col, is_test=False, save=os.path.join(diag_dir, f"{col}_train_diag.png"))
+            m.diagnostics(name=col, is_test=True,  save=os.path.join(diag_dir, f"{col}_test_diag.png"))
+            plt.close('all')
 
             p = m.params.copy()
             p['factor'] = col
             p['persistence'] = p['garch_alpha'] + p['garch_beta']
             params.append(p)
         
-        u_df = pd.DataFrame(uniforms)
-        u_df.index = pd.to_datetime(u_df.index).date
-        u_df.index.name = "Date"
-        u_df.to_csv(os.path.join(res_dir, "uniforms_har_garch_evt.csv"))
+        train_df, test_df = pd.DataFrame(train_u), pd.DataFrame(test_u)
+        train_df.index, test_df.index = pd.to_datetime(train_df.index).date, pd.to_datetime(test_df.index).date
+        train_df.index.name, test_df.index.name = "Date", "Date"
+        
+        train_df.to_csv(os.path.join(res_dir, "train_uniforms_har_garch_evt.csv"))
+        test_df.to_csv(os.path.join(res_dir, "test_uniforms_har_garch_evt.csv"))
         
         p_df = pd.DataFrame(params)
-        cols = ['factor'] + [c for c in p_df.columns if c != 'factor']
-        p_df = p_df[cols]
+        p_df = p_df[['factor'] + [c for c in p_df.columns if c != 'factor']]
         p_df.to_csv(os.path.join(res_dir, "har_garch_evt_params.csv"), index=False)
-        
-    else:
-        print(f"Error: Could not find factors.csv at {file_path}")

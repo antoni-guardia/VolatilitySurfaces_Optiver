@@ -33,7 +33,9 @@ class NGARCH_T:
     def _loglik(self, params, r):
         mu, omega, alpha, beta, theta, nu = params
         
-        if omega <= 0 or alpha <= 0 or beta < 0 or alpha + beta >= 1.0 or nu <= 2.0:
+        if omega <= 0 or alpha < 0 or beta < 0 or nu <= 2.01:
+            return 1e10
+        if alpha * (1 + theta**2) + beta >= 0.999:
             return 1e10
         
         sig = self._garch_vol(r, mu, omega, alpha, beta, theta)
@@ -52,16 +54,20 @@ class NGARCH_T:
 
         r_train, idx_train = r_full[:-holdout_days], idx_full[:-holdout_days]
         r_test, idx_test = r_full[-holdout_days:], idx_full[-holdout_days:]
-        
-        mu0, omega0 = np.mean(r_train), 0.01 * np.var(r_train)
+
+        scale = 100.0
+        r_train_scaled = r_train * scale
+
+        mu0 = np.mean(r_train_scaled)
+        omega0 = 0.05 * np.var(r_train_scaled)
         nu0 = max(2.1, 6.0 / max(0.1, pd.Series(r_train).kurtosis()) + 4.0)
-        x0 = [mu0, omega0, 0.08, 0.90, 0.5, nu0]
+        x0 = [mu0, omega0, 0.05, 0.90, 0.5, nu0]
         bounds = [(None, None), (1e-8, None), (1e-6, 0.5), (0.0, 0.999), (-10, 10), (2.1, 100)]
 
         # Fit
-        res = minimize(self._loglik, x0, args=(r_train,), method='L-BFGS-B', bounds=bounds,
-                      options={'maxiter': 2000, 'ftol': 1e-10})
-        self.params = res.x
+        res = minimize(self._loglik, x0, args=(r_train_scaled,), method='SLSQP', bounds=bounds, tol=1e-10)
+        mu_s, omega_s, alpha, beta, theta, nu = res.x
+        self.params = [mu_s / scale, omega_s / (scale**2), alpha, beta, theta, nu]
         mu, omega, alpha, beta, theta, nu = self.params
 
         # Filter
@@ -99,15 +105,11 @@ class NGARCH_T:
         
         # 1. Realized Returns vs Predicted Volatility Bands
         ax0 = fig.add_subplot(gs[0, :])
-
-        actual_returns = z * vol_series + mu
-        q95 = student_t.ppf(0.975, df=nu)
-
-        ax0.plot(u_series.index, actual_returns, lw=1, alpha=0.6, color='black', label='Realized Returns')
-        ax0.plot(u_series.index, mu + q95 * vol_series, 'r--', lw=1.5, label='Upper 95% Volatility Band')
-        ax0.plot(u_series.index, mu - q95 * vol_series, 'g--', lw=1.5, label='Lower 95% Volatility Band (VaR)')
-        ax0.set_title('Realized Returns vs. Predicted Conditional Volatility')
-        ax0.legend(loc='upper left')
+        ax0.plot(u_series.index, z, lw=0.5, alpha=0.7)
+        ax0.axhline(0, color='r', ls='--', lw=0.8)
+        ax0.axhline(2, color='orange', ls=':', lw=0.8)
+        ax0.axhline(-2, color='orange', ls=':', lw=0.8)
+        ax0.set_title('Standardized Residuals')
         ax0.grid(alpha=0.3)
         
         # 2. Histogram
@@ -194,9 +196,10 @@ if __name__ == "__main__":
         plt.close('all')
 
         mu, omega, alpha, beta, theta, nu = m.params
+        persistence = alpha * (1 + theta**2) + beta
         params.append({
             'asset': col, 'mu': mu, 'omega': omega, 'alpha': alpha,
-            'beta': beta, 'theta': theta, 'nu': nu, 'persistence': alpha + beta
+            'beta': beta, 'theta': theta, 'nu': nu, 'persistence': persistence
         })
         
     train_df, test_df = pd.DataFrame(train_u), pd.DataFrame(test_u)
