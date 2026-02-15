@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import json
 import os
 
 # Fits a Static Mixed R-Vine Copula to the data
@@ -36,82 +37,56 @@ def fit_static_mixed_vine(u_data):
     return model
 
 # Visualizations
-def copula_diagnostics(model, u_df, name="Static Mixed R-Vine", save=None):
-    n_vars = u_df.shape[1]
-    
-    # Identify the 3 strongest pairs empirically (Bypassing the missing get_tree API)
+def plot_large_heatmap(u_df, name, save_path):
+    """Saves a massive, high-res heatmap to identify dependency clusters."""
+    plt.figure(figsize=(25, 20))
     tau_matrix = u_df.corr(method='kendall')
-    upper_tri = tau_matrix.where(np.triu(np.ones(tau_matrix.shape), k=1).astype(bool))
-    sorted_pairs = upper_tri.unstack().dropna().abs().sort_values(ascending=False)
-    
-    top_pairs = []
-    for i in range(min(3, len(sorted_pairs))):
-        col1, col2 = sorted_pairs.index[i]
-        top_pairs.append((col1, col2))
+    # annot=False is critical here to prevent the 'black scribble'
+    sns.heatmap(tau_matrix, annot=False, cmap='coolwarm', center=0, cbar_kws={'label': "Kendall's Tau"})
+    plt.title(f"Joint Kendall's Tau Heatmap: {name}", fontsize=25)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
 
-    fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-    fig.suptitle(f'Copula Diagnostics: {name}', fontsize=16, fontweight='bold')
-
-    # 1. Tree 1 Structure
-    ax0 = fig.add_subplot(gs[0, 0:2])
-    try:
-        model.plot(tree=[0], vars_names=u_df.columns.tolist())
-        ax0.set_title("Primary Dependence Structure (Tree 1)")
-    except Exception as e:
-        ax0.text(0.5, 0.5, f"Vine Plotting not supported in this pyvinecopulib version.\n({e})", 
-                 ha='center', va='center', fontsize=12)
-        ax0.set_title("Primary Dependence Structure")
-        ax0.axis('off')
-
-    # 2. Family Distribution
-    ax1 = fig.add_subplot(gs[0, 2])
+def plot_family_dist(model, name, save_path):
+    """Visualizes which copula families (Clayton/Gumbel) dominate the system."""
     families = []
     for tree_cops in model.pair_copulas:
         for bicop in tree_cops:
             families.append(str(bicop.family).split('.')[-1].capitalize())
-            
-    pd.Series(families).value_counts().plot(kind='barh', ax=ax1, color='teal')
-    ax1.set_title("Selected Copula Families")
-    ax1.grid(axis='x', alpha=0.3)
-
-    # 3. Kendall's Tau Heatmap
-    ax2 = fig.add_subplot(gs[1, 0:2])
-    sns.heatmap(tau_matrix, annot=True, cmap='coolwarm', fmt=".2f", ax=ax2)
-    ax2.set_title("Empirical Kendall's Tau (Joint Dependencies)")
-
-    # 4. Model Log-Likelihood & AIC Info
-    ax3 = fig.add_subplot(gs[1, 2])
-    ax3.axis('off')
     
-    # Calculate stats
-    u_numpy = u_df.to_numpy()
-    stats_text = (
-        f"Variables: {model.dim}\n"
-        f"Observations: {u_df.shape[0]}\n"
-        f"Log-Likelihood: {model.loglik(u_numpy):.2f}\n"
-        f"AIC: {model.aic(u_numpy):.2f}\n"
-        f"BIC: {model.bic(u_numpy):.2f}\n"
-        f"Thread Count: {os.cpu_count()-1 if os.cpu_count() else 1}"
-    )
-    ax3.text(0.1, 0.5, stats_text, fontsize=12, family='monospace', 
-             bbox=dict(boxstyle='round', fc='aliceblue', alpha=0.5))
-    ax3.set_title("Model Fit Statistics")
+    plt.figure(figsize=(12, 7))
+    pd.Series(families).value_counts().plot(kind='bar', color='teal')
+    plt.title(f"Selected Copula Families: {name}", fontsize=18)
+    plt.ylabel("Frequency (Edges in Vine)")
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', alpha=0.3)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
 
-    # 5. Top 3 Pairwise Scatters
-    for i, (c1, c2) in enumerate(top_pairs):
-        ax = fig.add_subplot(gs[2, i])
-        ax.scatter(u_df[c1], u_df[c2], s=2, alpha=0.4, color='darkblue')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.set_xlabel(c1)
-        ax.set_ylabel(c2)
-        ax.set_title(f"Top Pair {i+1}: {c1} vs {c2}")
+def plot_spot_vol_scatters(u_df, name, save_path):
+    """Specifically plots the Top 6 Spot vs. Vol-Factor relationships."""
+    # Find columns starting with 'G_PC' or 'L_PC' (Factors) and Spot assets
+    factors = [c for c in u_df.columns if '_PC_' in c]
+    spots = [c for c in u_df.columns if '_PC_' not in c]
+    
+    # Simple logic: Find the factor with the highest absolute correlation to the first Spot
+    target_spot = spots[0] # Usually 'SPY' or your main asset
+    corrs = u_df[factors].corrwith(u_df[target_spot], method='kendall').abs().sort_values(ascending=False)
+    top_6_factors = corrs.index[:6]
+
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle(f"Top Spot-Vol Dependencies: {name} (Target: {target_spot})", fontsize=20)
+    
+    for i, factor in enumerate(top_6_factors):
+        ax = axes[i // 3, i % 3]
+        ax.scatter(u_df[target_spot], u_df[factor], s=1, alpha=0.3, color='darkblue')
+        ax.set_title(f"{target_spot} vs {factor}\nTau: {corrs[factor]:.2f}")
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
         ax.grid(alpha=0.2)
-
-    if save:
-        plt.savefig(save, dpi=300, bbox_inches='tight')
-    return fig
+        
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path, dpi=300)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -126,30 +101,26 @@ if __name__ == "__main__":
     u_spot = pd.read_csv(u_spot_file, index_col=0)
     u_spot.index = pd.to_datetime(u_spot.index).date
 
-    # Global Valid Dates based on NSDE
+    # Align Dates
     u_har_path = os.path.join(res_dir, "uniforms_har_garch_evt.csv")
     u_nsde_path = os.path.join(res_dir, "nsde_uniforms.csv")
 
     if os.path.exists(u_har_path) and os.path.exists(u_nsde_path):
         u_har_ref = pd.read_csv(u_har_path, index_col=0)
         u_har_ref.index = pd.to_datetime(u_har_ref.index).date
-        
         u_nsde_ref = pd.read_csv(u_nsde_path, index_col=False)
         
         valid_har_dates = u_spot.index.intersection(u_har_ref.index)
         global_valid_dates = valid_har_dates[-len(u_nsde_ref):]
-        
-        print(f"Enforcing strict comparability. Models will be evaluated on {len(global_valid_dates)} overlapping dates.")
         print(f"Evaluation Period: {global_valid_dates[0]} to {global_valid_dates[-1]}")
+
     else:
         print("Missing required files to establish global dates.")
         exit()
 
     # Fit Models 
-    factor_sets = {
-        "HAR-GARCH-EVT": "uniforms_har_garch_evt.csv",
-        "NSDE": "nsde_uniforms.csv"
-    }
+    factor_sets = {"HAR-GARCH-EVT": "uniforms_har_garch_evt.csv", "NSDE": "nsde_uniforms.csv"}
+    results_summary = []
 
     for factor_name, file_name in factor_sets.items():
         u_factor_path = os.path.join(res_dir, file_name)
@@ -172,20 +143,22 @@ if __name__ == "__main__":
                 continue
             
             joint_model = fit_static_mixed_vine(combined_u.to_numpy())
-            print(joint_model.structure)
-            print(f"Variable Order: {joint_model.order}")
-            
-            save_name = f"joint_vine_spot_{factor_name.lower().replace('-', '_')}"
-            diag_path = os.path.join(out_dir, f"{save_name}_diag.png")
-            
-            copula_diagnostics(
-                joint_model, 
-                combined_u, 
-                name=f"Spot + {factor_name} Joint Vine", 
-                save=diag_path
-            )
 
-            joint_model.save(os.path.join(out_dir, f"{save_name}.json"))
+            order = joint_model.order
+            ordered_names = [combined_u.columns[int(i) - 1] for i in order]
+            print(f"Top 5 Root Nodes (Importance): {ordered_names[:5]}")
+            print(f"Log-Likelihood: {joint_model.loglik(combined_u.to_numpy()):.2f}")
+            print(f"AIC: {joint_model.aic(combined_u.to_numpy()):.2f}")
+            
+            # Diagnostics
+
+            save_prefix = f"joint_vine_spot_{factor_name.lower().replace('-', '_')}"
+            plot_large_heatmap(combined_u, factor_name, os.path.join(out_dir, f"{save_prefix}_heatmap.png"))
+            plot_family_dist(joint_model, factor_name, os.path.join(out_dir, f"{save_prefix}_families.png"))
+            plot_spot_vol_scatters(combined_u, factor_name, os.path.join(out_dir, f"{save_prefix}_scatters.png"))
+
+            with open(os.path.join(out_dir, f"{save_prefix}.json"), "w") as f:
+                f.write(joint_model.to_json())
     
         else:
             print(f"Warning: {file_name} not found. Skipping {factor_name} loop.")
