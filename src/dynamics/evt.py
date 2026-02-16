@@ -16,6 +16,9 @@ class EVT:
         # Gaussian KDE object fitted to the body region
         self.body_kde = None
         
+        # Inverse interpolator for the body region (u -> z)
+        self.body_interp = None
+        
         # Tail probabilities (quantile levels used for thresholding)
         self.eta_l = None 
         self.eta_u = None
@@ -70,13 +73,43 @@ class EVT:
             self.body_kde = gaussian_kde(body_data)
             self.body_min_cdf = self.body_kde.integrate_box_1d(-np.inf, self.u_lower)
             self.body_max_cdf = self.body_kde.integrate_box_1d(-np.inf, self.u_upper)
+            
+            # Pre-compute inverse interpolation for the body to speed up simulation
+            self._setup_body_interpolation()
         else:
             self.body_kde = None
+            self.body_interp = None
 
         self._is_fitted = True
         return self
 
+    def _setup_body_interpolation(self, n_points=1000):
+        """
+        Creates a lookup table (interpolator) for the body region.
+        This maps u (probability) back to z (quantile) efficiently.
+        """
+        # Create a grid of z values within the body bounds
+        z_grid = np.linspace(self.u_lower, self.u_upper, n_points)
+        
+        # Calculate raw KDE CDF values for this grid
+        raw_cdf = np.array([self.body_kde.integrate_box_1d(-np.inf, x) for x in z_grid])
+        
+        # Normalize raw CDF to the target Uniform range [eta_l, 1 - eta_u]
+        target_range = (1 - self.eta_u) - self.eta_l
+        raw_range = self.body_max_cdf - self.body_min_cdf
+        
+        if raw_range > 1e-9:
+            u_grid = self.eta_l + (raw_cdf - self.body_min_cdf) * (target_range / raw_range)
+        else:
+            u_grid = np.linspace(self.eta_l, 1 - self.eta_u, n_points)
+            
+        # Create interpolator: u -> z
+        self.body_interp = interp1d(u_grid, z_grid, kind='linear', bounds_error=False, fill_value="extrapolate")
+
     def transform(self, z):
+        """
+        Probability Integral Transform (PIT): Maps z -> u in [0, 1]
+        """
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted before transform.")
             
@@ -120,8 +153,6 @@ class EVT:
             raw_cdf = np.array([self.body_kde.integrate_box_1d(-np.inf, x) for x in z[mask_b]])
             
             # Normalize raw_cdf from [min_cdf, max_cdf] to [eta_l, 1-eta_u]
-            # Formula: Scaled = Target_Min + (Raw - Raw_Min) * (Target_Range / Raw_Range)
-            
             target_range = (1 - self.eta_u) - self.eta_l
             raw_range = self.body_max_cdf - self.body_min_cdf
             
@@ -134,3 +165,55 @@ class EVT:
             u[mask_b] = 0.5
 
         return np.clip(u, 1e-6, 1-1e-6)
+
+    def inverse_transform(self, u):
+        """
+        Inverse Probability Integral Transform (Inverse PIT): Maps u -> z
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Model must be fitted before inverse_transform.")
+
+        z = np.zeros_like(u, dtype=float)
+        
+        # --- Lower Tail (Inverse GPD) ---
+        mask_l = u < self.eta_l
+        if np.any(mask_l):
+            if self.params_lower:
+                xi, _, sigma = self.params_lower
+                # GPD PPF logic:
+                # u_scaled = u / eta_l  (prob within lower tail sector)
+                # target_cdf = 1 - u_scaled (since lower tail CDF integrates from right to left in excess terms)
+                # excess = GPD_PPF(target_cdf)
+                val_gpd = genpareto.ppf(1 - u[mask_l]/self.eta_l, xi, 0, sigma)
+                z[mask_l] = self.u_lower - val_gpd
+            else:
+                # Fallback to Normal
+                from scipy.stats import norm
+                z[mask_l] = norm.ppf(u[mask_l])
+
+        # --- Upper Tail (Inverse GPD) ---
+        mask_u = u > (1 - self.eta_u)
+        if np.any(mask_u):
+            if self.params_upper:
+                xi, _, sigma = self.params_upper
+                # GPD PPF logic:
+                # u_scaled = (u - (1 - eta_u)) / eta_u
+                # excess = GPD_PPF(u_scaled)
+                p_gpd = (u[mask_u] - (1 - self.eta_u)) / self.eta_u
+                val_gpd = genpareto.ppf(p_gpd, xi, 0, sigma)
+                z[mask_u] = self.u_upper + val_gpd
+            else:
+                from scipy.stats import norm
+                z[mask_u] = norm.ppf(u[mask_u])
+
+        # --- Body (Inverse Interpolation) ---
+        mask_b = (~mask_l) & (~mask_u)
+        if np.any(mask_b):
+            if self.body_interp:
+                z[mask_b] = self.body_interp(u[mask_b])
+            else:
+                # Fallback if body fit failed (rare)
+                from scipy.stats import norm
+                z[mask_b] = norm.ppf(u[mask_b])
+                
+        return z
