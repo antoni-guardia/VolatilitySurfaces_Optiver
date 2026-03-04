@@ -5,3 +5,4 @@ models/*
 # But allow the placeholder files so the folders appear on GitHub
 !data/.gitkeep
 !models/.gitkeep
+*.pkl
