@@ -43,4 +43,4 @@ assert len(N_PC_LOCAL) == N_ASSETS, "Mismatch between number of assets and local
 
 # 6. VINE TRUNCATION LEVELS
 K_HAR_GARCH = 17
-K_NSDE = 20
+K_NSDE = 24
