@@ -6,7 +6,7 @@ import seaborn as sns
 import os
 import random
 
-def analyze_tree_subsets_interactive(model, u_train, var_names, name):
+def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir):
     d = len(var_names)
     is_spot = {i: ('PC' not in var_names[i]) for i in range(d)}
     
@@ -60,6 +60,7 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name):
     # Find what it decays to 5 trees later
     decay_tree = min(max_sv_tree + 5, max_tree)
     val_at_decay = df_res[df_res['Tree'] == decay_tree]['Spot_Vol'].values[0]
+    save_path = os.path.join(graph_dir, f"{name}_vine_truncation_analysis.png")
 
     print(f"\n" + "="*50)
     print(f"--- DYNAMIC ECONOMIC INSIGHTS: {name} ---")
@@ -95,6 +96,7 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name):
     
     plt.title(f"Structural Validation & Economic Decay: {name}", fontsize=16, fontweight='bold')
     plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
     
     # Show the plot to the user (Code will pause here until they close the window)
     print("\n[!] Please review the popup graph to make your decision...")
@@ -112,6 +114,8 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
     res_dir = os.path.join(project_root, "results", "dynamics")
+    graph_dir = os.path.join(project_root, "results", "copulas", "static", "plots")
+    os.makedirs(graph_dir, exist_ok=True)
 
     u_spot_file = os.path.join(res_dir, "NGARCH", "uniforms_ngarch_train.csv")
     u_har_file = os.path.join(res_dir, "HAR_GARCH", "uniforms_har_garch_evt_train.csv")
@@ -143,7 +147,7 @@ if __name__ == "__main__":
         exploratory_model = pv.Vinecop(d=d)
         exploratory_model.select(np_data_train, controls=controls)
         
-        chosen_k = analyze_tree_subsets_interactive(exploratory_model, np_data_train, var_names, factor_name)
+        chosen_k = analyze_tree_subsets_interactive(exploratory_model, np_data_train, var_names, factor_name, graph_dir)
         optimal_ranks[factor_name] = chosen_k
 
     print("\n" + "="*50)

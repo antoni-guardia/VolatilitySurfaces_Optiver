@@ -119,6 +119,22 @@ def plot_family_dist(model, name, save_path):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
+def print_family_counts(model, name):
+    """Counts and prints the exact number of each copula family used in the vine."""
+    families = []
+    for tree_cops in model.pair_copulas:
+        for bicop in tree_cops:
+            families.append(str(bicop.family).split('.')[-1].capitalize())
+            
+    counts = pd.Series(families).value_counts()
+    
+    print(f"\nCopula Family Breakdown ({name}):")
+    print("-" * 35)
+    for family, count in counts.items():
+        print(f" - {family:.<15} {count} edges")
+    print("-" * 35)
+    print(f" - TOTAL:.......... {len(families)} edges\n")
+
 def plot_simulated_vs_empirical(model, u_df, name, save_path):
     """Simulates from the copula to verify goodness-of-fit on a diverse set of pairs."""
     # Force a deep copy so the underlying array is completely mutable
@@ -233,6 +249,7 @@ if __name__ == "__main__":
         print(f"In-Sample Log-Likelihood: {joint_model.loglik(np_data_train):.2f}")
         print(f"In-Sample AIC:            {joint_model.aic(np_data_train):.2f}")
         print(f"In-Sample BIC:            {joint_model.bic(np_data_train):.2f}")
+        print_family_counts(joint_model, factor_name)
 
         # --- Diagnostics & Plotting ---
         print("\nGenerating Diagnostic Plots...")

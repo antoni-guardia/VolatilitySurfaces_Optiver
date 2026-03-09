@@ -42,5 +42,5 @@ N_PC_LOCAL = [3,    3,    3,   4,     3,   3,   3,    3,    3,    3,   3,   5,  
 assert len(N_PC_LOCAL) == N_ASSETS, "Mismatch between number of assets and local PC ranks!"
 
 # 6. VINE TRUNCATION LEVELS
-K_HAR_GARCH = 17
-K_NSDE = 24
+K_HAR_GARCH = 12
+K_NSDE = 14
