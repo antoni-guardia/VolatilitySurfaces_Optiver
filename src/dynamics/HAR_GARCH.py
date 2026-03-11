@@ -87,6 +87,15 @@ class HAR_GARCH_EVT:
             vol_full[t] = omega + alpha * res_full[t-1]**2 + beta * vol_full[t-1]
         vol_full = np.sqrt(vol_full)
         
+        # OOS evaluation metrics
+        var_test = vol_full[-holdout_days:]**2
+        ll_oos = -0.5 * np.sum(np.log(2 * np.pi) + np.log(var_test) + (res_test**2) / var_test)
+        mse_train = np.mean(res_train**2)
+        mse_test = np.mean(res_test**2)
+        self.params['loglikelihood_oos'] = ll_oos
+        self.params['mse_train'] = mse_train
+        self.params['mse_test'] = mse_test
+
         z_train = res_train / vol_full[:-holdout_days]
         z_test = res_test / vol_full[-holdout_days:]
         
@@ -201,7 +210,7 @@ if __name__ == "__main__":
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
     file_path = os.path.join(project_root, "results", "factors", "factors.csv")
-    res_dir = os.path.join(project_root, "results", "dynamics", "HAR-GARCH")
+    res_dir = os.path.join(project_root, "results", "dynamics", "HAR_GARCH")
     diag_dir = os.path.join(res_dir, "plots")
     os.makedirs(diag_dir, exist_ok=True)
 
@@ -244,12 +253,12 @@ if __name__ == "__main__":
         train_df.index, test_df.index = pd.to_datetime(train_df.index).date, pd.to_datetime(test_df.index).date
         train_df.index.name, test_df.index.name = "Date", "Date"
         
-        train_df.to_csv(os.path.join(res_dir, "train_uniforms_har_garch_evt.csv"))
-        test_df.to_csv(os.path.join(res_dir, "test_uniforms_har_garch_evt.csv"))
+        train_df.to_csv(os.path.join(res_dir, "uniforms_har_garch_evt_train.csv"))
+        test_df.to_csv(os.path.join(res_dir, "uniforms_har_garch_evt_test.csv"))
         
         p_df = pd.DataFrame(params)
         p_df = p_df[['factor'] + [c for c in p_df.columns if c != 'factor']]
-        p_df.to_csv(os.path.join(res_dir, "har_garch_evt_params.csv"), index=False)
+        p_df.to_csv(os.path.join(res_dir, "params_har_garch_evt.csv"), index=False)
 
         # Create DataFrames from the dictionaries
         train_df, test_df = pd.DataFrame(train_u), pd.DataFrame(test_u)

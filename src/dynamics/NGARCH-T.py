@@ -22,10 +22,10 @@ class NGARCH_T:
         self.resids = None
         self.test_resids = None
         
-    def _garch_vol(self, r, mu, omega, alpha, beta, theta):
+    def _garch_vol(self, r, mu, omega, alpha, beta, theta, init_var=None):
         T = len(r)
         sig2 = np.zeros(T)
-        sig2[0] = np.var(r)
+        sig2[0] = init_var if init_var is not None else np.var(r)
         
         for t in range(1, T):
             eps = r[t-1] - mu
@@ -86,7 +86,7 @@ class NGARCH_T:
         r_train_scaled = r_train * scale
 
         x0 = [np.mean(r_train_scaled), 0.05 * np.var(r_train_scaled), 0.05, 0.90, 0.5, 6.0]
-        bounds = [(-10, 10), (1e-6, 10), (0.0, 0.5), (0.5, 0.99), (-5, 5), (2.1, 50)]
+        bounds = [(-10, 10), (1e-6, 10), (0.0, 0.5), (0.5, 0.99), (-3, 3), (2.1, 50)]
 
         res = minimize(self._loglik, x0, args=(r_train_scaled,), method='SLSQP', bounds=bounds, tol=1e-6)
         
@@ -97,7 +97,8 @@ class NGARCH_T:
 
         # --- THE FIX: Filter in the SCALED space, then downscale ---
         r_full_scaled = r_full * scale
-        vol_full_scaled = self._garch_vol(r_full_scaled, mu_s, omega_s, alpha, beta, theta)
+        train_var = np.var(r_train_scaled)
+        vol_full_scaled = self._garch_vol(r_full_scaled, mu_s, omega_s, alpha, beta, theta, init_var=train_var)
         
         # Downscale vol back to original return space
         vol_full = vol_full_scaled / scale
@@ -114,6 +115,17 @@ class NGARCH_T:
         self.test_vol = vol_full[-holdout_days:]
         self.resids = z_full[:-holdout_days]
         self.test_resids = z_full[-holdout_days:]
+
+        # OOS evaluation metrics
+        mu_unscaled = self.params[0]
+        nu = self.params[5]
+        r_test = r_full[-holdout_days:]
+        test_vol_arr = vol_full[-holdout_days:]
+        z_test = z_full[-holdout_days:]
+        
+        ll_const = gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * nu)
+        self.loglik_oos = np.sum(ll_const - ((nu + 1) / 2) * np.log(1 + z_test**2 / nu) - np.log(test_vol_arr))
+        self.mse_oos = np.mean(((r_test - mu_unscaled)**2 - test_vol_arr**2)**2)
         
         return self
     
@@ -230,7 +242,7 @@ if __name__ == "__main__":
     script_dir = os.path.join(project_root, "data", "processed")
     data_path = os.path.join(script_dir, "returns.csv")
 
-    res_dir = os.path.join(project_root, "results", "dynamics", "NGARCH-T")
+    res_dir = os.path.join(project_root, "results", "dynamics", "NGARCH")
     os.makedirs(res_dir, exist_ok=True)
         
     diag_dir = os.path.join(res_dir, "plots")
@@ -257,7 +269,8 @@ if __name__ == "__main__":
         mu, omega, alpha, beta, theta, nu = m.params
         persistence = alpha * (1 + theta**2) + beta
         params.append({'asset': col, 'mu': mu, 'omega': omega, 'alpha': alpha,
-                       'beta': beta, 'theta': theta, 'nu': nu, 'persistence': persistence})
+                       'beta': beta, 'theta': theta, 'nu': nu, 'persistence': persistence,
+                       'loglik_oos': m.loglik_oos, 'mse_oos': m.mse_oos})
 
         # Evaluaiton
         mu_val, _, _, _, _, nu_val = m.params
@@ -291,11 +304,11 @@ if __name__ == "__main__":
     train_df.index, test_df.index = pd.to_datetime(train_df.index).date, pd.to_datetime(test_df.index).date
     train_df.index.name, test_df.index.name = "Date", "Date"
 
-    train_df.to_csv(os.path.join(res_dir, "train_uniforms_ngarch_t.csv"))
-    test_df.to_csv(os.path.join(res_dir, "test_uniforms_ngarch_t.csv"))
+    train_df.to_csv(os.path.join(res_dir, "uniforms_ngarch_train.csv"))
+    test_df.to_csv(os.path.join(res_dir, "uniforms_ngarch_test.csv"))
 
     p_df = pd.DataFrame(params)
-    p_df.to_csv(os.path.join(res_dir, "ngarch_t_params.csv"), index=False)
+    p_df.to_csv(os.path.join(res_dir, "params_ngarch.csv"), index=False)
 
     # Uniformity Report
     alpha = 0.05
