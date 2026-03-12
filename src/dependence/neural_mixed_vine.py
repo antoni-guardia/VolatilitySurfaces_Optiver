@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -211,8 +212,8 @@ class NeuralPairCopula(nn.Module):
         u_clamped = torch.clamp(u_vec, eps, 1-eps)
         v_clamped = torch.clamp(v_vec, eps, 1-eps)
         
-        x_in = torch.erfinv(2 * u_clamped - 1) * 1.414
-        y_in = torch.erfinv(2 * v_clamped - 1) * 1.414
+        x_in = torch.erfinv(2 * u_clamped - 1) * math.sqrt(2)
+        y_in = torch.erfinv(2 * v_clamped - 1) * math.sqrt(2)
         
         inputs = torch.stack([x_in, y_in], dim=1).unsqueeze(0) 
         
@@ -245,7 +246,7 @@ def objective(trial, u_full, v_full, split_idx, fam_str, rotation, static_theta,
 
     device = torch.device("cpu")
     model = NeuralPairCopula(fam_str, rotation=rotation, hidden_dim=hidden_dim, 
-                             num_layers=num_layers, dropout=dropout).to(device)
+                             num_layers=num_layers, dropout=dropout).double().to(device)
     model.warm_start(static_theta, static_nu)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -290,44 +291,132 @@ def objective(trial, u_full, v_full, split_idx, fam_str, rotation, static_theta,
     return val_loss.item()
 
 def run_hyperparameter_search(u_matrix, static_model):
-    T = u_matrix.shape[0]
+    """Run Optuna HPO on one representative edge per copula family in Tree 1.
+    
+    If all families converge to similar architectures (same hidden_dim), deploys
+    a universal configuration. Otherwise, returns family-specific architectures.
+    """
+    T, N = u_matrix.shape[0], u_matrix.shape[1]
     split_idx = int(np.floor(T * 0.8))
 
     M = np.array(static_model.matrix, dtype=np.int64)
-    if M.max() == u_matrix.shape[1]: M -= 1 
+    if M.max() == N: M -= 1 
     if np.sum(M[0] >= 0) > np.sum(M[-1] >= 0): M = np.flipud(M)
     
-    var_1 = M[u_matrix.shape[1]-1, 0]
-    var_2 = M[0, 0]
+    fams = static_model.pair_copulas
+    tree_0_edges = N - 1
     
-    u_full = torch.tensor(np.nan_to_num(u_matrix[:, var_1], 0.5), dtype=torch.float64)
-    v_full = torch.tensor(np.nan_to_num(u_matrix[:, var_2], 0.5), dtype=torch.float64)
+    # --- Step 1: Scan Tree 1 to find the strongest edge per family ---
+    family_candidates = {}  # family_base -> (edge_idx, |tau|, edge_info)
     
-    pc = static_model.pair_copulas[0][0]
-    fam_str = str(pc.family)
-    rotation = int(pc.rotation)
-    params = pc.parameters.flatten()
-    static_theta = float(params[0]) if len(params) > 0 else None
-    static_nu = float(params[1]) if len(params) > 1 else None
-
-    print(f"\n--- Starting Optuna HPO on Root Node ({fam_str}) ---")
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="minimize")
-    
-    study.optimize(lambda trial: objective(trial, u_full, v_full, split_idx, 
-                                           fam_str, rotation, static_theta, static_nu), 
-                   n_trials=30)
-    
-    print("Best Hyperparameters Found:")
-    for key, value in study.best_trial.params.items():
-        print(f"  {key}: {value}")
+    for edge in range(tree_0_edges):
+        pc = fams[0][edge]
+        fam_str = str(pc.family)
         
-    return study.best_trial.params
+        # Normalize family name (strip rotations for grouping)
+        fam_base = fam_str.split('.')[-1].lower()
+        for prefix in ['gaussian', 'student', 'clayton', 'gumbel', 'frank']:
+            if prefix in fam_base:
+                fam_base = prefix
+                break
+        
+        if 'indep' in fam_base:
+            continue
+            
+        # Extract edge data
+        row = N - 1
+        var_1 = M[row, edge]
+        var_2 = M[edge, edge]
+        
+        u_edge = np.nan_to_num(u_matrix[:, var_1], nan=0.5)
+        v_edge = np.nan_to_num(u_matrix[:, var_2], nan=0.5)
+        
+        tau_abs = abs(kendalltau(u_edge, v_edge)[0])
+        
+        params = pc.parameters.flatten()
+        static_theta = float(params[0]) if len(params) > 0 else None
+        static_nu = float(params[1]) if len(params) > 1 else None
+        
+        # Keep the strongest edge per family
+        if fam_base not in family_candidates or tau_abs > family_candidates[fam_base][1]:
+            family_candidates[fam_base] = (edge, tau_abs, {
+                'fam_str': fam_str,
+                'rotation': int(pc.rotation),
+                'static_theta': static_theta,
+                'static_nu': static_nu,
+                'u': torch.tensor(u_edge, dtype=torch.float64),
+                'v': torch.tensor(v_edge, dtype=torch.float64),
+            })
+    
+    print(f"\n--- Per-Family HPO: Found {len(family_candidates)} active families in Tree 1 ---")
+    for fam, (eidx, tau, _) in family_candidates.items():
+        print(f"  {fam.capitalize():>10}: Edge {eidx} (|tau| = {tau:.3f})")
+    
+    # --- Step 2: Run independent Optuna study per family ---
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    family_results = {}
+    
+    for fam_base, (edge_idx, tau_abs, info) in family_candidates.items():
+        print(f"\n  Optimizing {fam_base.capitalize()} (Edge {edge_idx})...")
+        
+        # Bind loop variables via default arguments to avoid late-binding closure bug
+        _u = info['u']
+        _v = info['v']
+        _fam = info['fam_str']
+        _rot = info['rotation']
+        _theta = info['static_theta']
+        _nu = info['static_nu']
+        
+        study = optuna.create_study(direction="minimize")
+        study.optimize(
+            lambda trial, u=_u, v=_v, f=_fam, r=_rot, t=_theta, n=_nu: objective(
+                trial, u, v, split_idx, f, r, t, n
+            ),
+            n_trials=30
+        )
+        
+        best = study.best_trial.params
+        print(f"    -> hidden_dim={best['hidden_dim']}, layers={best['num_layers']}, "
+              f"lr={best['lr']:.4f}, val_loss={study.best_value:.2f}")
+        
+        family_results[fam_base] = {
+            'params': best,
+            'val_loss': study.best_value,
+            'edge_idx': edge_idx,
+            'tau': tau_abs
+        }
+    
+    # --- Step 3: Check convergence across families ---
+    hidden_dims = [r['params']['hidden_dim'] for r in family_results.values()]
+    all_converge = len(set(hidden_dims)) == 1
+    
+    if all_converge:
+        # All families agree on architecture -> deploy universal config
+        # Pick the params from the family with the best validation loss
+        best_family = min(family_results, key=lambda f: family_results[f]['val_loss'])
+        universal_params = family_results[best_family]['params']
+        
+        print(f"\n  CONVERGENCE: All families selected hidden_dim={hidden_dims[0]}.")
+        print(f"  Deploying universal architecture from {best_family.capitalize()}.")
+        
+        return universal_params
+    else:
+        # Families diverge -> return family-keyed dict
+        print(f"\n  DIVERGENCE: hidden_dims vary across families: {dict(zip(family_results.keys(), hidden_dims))}")
+        print(f"  Deploying family-specific architectures.")
+        
+        family_params = {fam: r['params'] for fam, r in family_results.items()}
+        return family_params
 
 # ====================================================================================
 # --- PARALLEL VINE FITTING ---
 # ====================================================================================
 def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, h_storage_subset, T, hpo_params):
+    # Critical: propagate float64 default into forked joblib workers
+    torch.set_default_dtype(torch.float64)
+    torch.set_num_threads(1)
+    torch.manual_seed(42 + tree * 1000 + edge)
+    
     u_vec = torch.tensor(h_storage_subset['u'], dtype=torch.float64)
     v_vec = torch.tensor(h_storage_subset['v'], dtype=torch.float64)
 
@@ -336,13 +425,12 @@ def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_th
                        'oos_forecast': 0.0, 'nll': 0.0, 'aic': 0.0, 'bic': 0.0}
         return edge, partner_col, result_dict, u_vec, v_vec
 
-    torch.set_num_threads(1)
     device = torch.device("cpu")
     
     model = NeuralPairCopula(fam_str, rotation=rotation, 
                              hidden_dim=hpo_params['hidden_dim'], 
                              num_layers=hpo_params['num_layers'], 
-                             dropout=hpo_params['dropout'] if 'dropout' in hpo_params else 0.0).to(device)
+                             dropout=hpo_params['dropout'] if 'dropout' in hpo_params else 0.0).double().to(device)
     model.warm_start(static_theta, static_nu)
     
     optimizer = optim.AdamW(model.parameters(), lr=hpo_params['lr'], weight_decay=hpo_params['weight_decay'])
@@ -350,6 +438,8 @@ def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_th
     
     loss_hist = []
     best_loss = float('inf')
+    best_nll = float('inf')
+    best_state = None
     patience_counter = 0
     patience_limit = 15
     max_epochs = 200
@@ -357,7 +447,7 @@ def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_th
     for epoch in range(max_epochs):
         optimizer.zero_grad()
         loss_vec, _ = model(u_vec, v_vec) 
-        loss = torch.sum(loss_vec) # Sum to get total NLL
+        loss = torch.sum(loss_vec)
         
         if torch.isnan(loss): break
             
@@ -371,27 +461,29 @@ def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_th
         
         if current_loss < best_loss - 1e-4:
             best_loss = current_loss
+            best_nll = current_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
             
         if patience_counter >= patience_limit: break
-            
-    _, theta_path = model(u_vec, v_vec)
-    theta_path = theta_path.detach()
     
-    nu_val = model.get_nu()
-    if nu_val is not None: nu_val = nu_val.detach()
+    # Restore best weights and compute final outputs without graph overhead
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    with torch.no_grad():
+        _, theta_path = model(u_vec, v_vec)
         
-    h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
-    h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
+        nu_val = model.get_nu()
+        if nu_val is not None: nu_val = nu_val.detach()
+            
+        h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
+        h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
     
-    # AIC / BIC Calculations
-    if 'student' in fam_str: param_base = 4 
-    else: param_base = 3 
-    
-    final_nll = loss_hist[-1] if loss_hist else float('nan')
-    k = sum(p.numel() for p in model.parameters() if p.requires_grad) # Total NN weights
+    final_nll = best_nll if best_state is not None else (loss_hist[-1] if loss_hist else float('nan'))
+    k = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     aic = 2 * k + 2 * final_nll
     bic = k * np.log(T) + 2 * final_nll
@@ -401,13 +493,34 @@ def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_th
         'path': theta_path.numpy(),
         'family': fam_str,
         'rotation': rotation,
-        'oos_forecast': model.oos_forecast.numpy(),
+        'oos_forecast': model.oos_forecast.item(),
         'nll': final_nll,
         'aic': aic,
         'bic': bic
     }
     
     return edge, partner_col, result_dict, h_direct, h_indirect
+
+def _resolve_hpo_params(hpo_params, fam_str):
+    """Resolve HPO params for a given edge. If hpo_params is a flat dict (universal
+    architecture), return it directly. If it's a family-keyed dict, look up the
+    matching family. Falls back to the family with the best validation loss."""
+    # Universal case: has 'hidden_dim' at top level
+    if 'hidden_dim' in hpo_params:
+        return hpo_params
+    
+    # Family-specific case: keys are family names
+    fam_base = fam_str.split('.')[-1].lower()
+    for prefix in ['gaussian', 'student', 'clayton', 'gumbel', 'frank']:
+        if prefix in fam_base:
+            fam_base = prefix
+            break
+    
+    if fam_base in hpo_params:
+        return hpo_params[fam_base]
+    
+    # Fallback: use the first available family's params
+    return next(iter(hpo_params.values()))
 
 def fit_neural_vine(u_matrix, structure, hpo_params):
     T, N = u_matrix.shape
@@ -453,7 +566,10 @@ def fit_neural_vine(u_matrix, structure, hpo_params):
             u_np = np.nan_to_num(u_vec, 0.5)
             v_np = np.nan_to_num(v_vec, 0.5)
             
-            tasks.append((tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, {'u': u_np, 'v': v_np}, T, hpo_params))
+            # Resolve the correct HPO params for this edge's family
+            edge_hpo = _resolve_hpo_params(hpo_params, fam_str)
+            
+            tasks.append((tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, {'u': u_np, 'v': v_np}, T, edge_hpo))
             
         results = Parallel(n_jobs=active_cores, return_as="generator")(delayed(fit_single_neural_edge)(*t) for t in tasks)
 

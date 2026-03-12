@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -253,40 +254,49 @@ class GASPairCopula(nn.Module):
         B = self.get_B()
         nu = self.get_nu()
         score_variance = torch.tensor(1.0, device=u_data.device)
-        alpha = 0.99 
+        alpha = 0.99  # EWMA decay for Fisher information scaling
         
         log_likes = []
         thetas = []
+        
+        # --- Vectorized pre-computation: rotate and ICDF the full series once ---
+        u_all, v_all = self.rotate_data(u_data.squeeze(), v_data.squeeze())
+        u_all = torch.clamp(u_all, 1e-9, 1 - 1e-9)
+        v_all = torch.clamp(v_all, 1e-9, 1 - 1e-9)
+        
+        x_all = y_all = None
+        if 'gaussian' in self.family:
+            n = torch.distributions.Normal(0, 1)
+            x_all = n.icdf(u_all)
+            y_all = n.icdf(v_all)
+        elif 'student' in self.family:
+            x_all = inverse_t_cdf(u_all, nu)
+            y_all = inverse_t_cdf(v_all, nu)
         
         for t in range(T):
             theta_t = self.transform_parameter(f_t)
             thetas.append(theta_t.view(-1)) 
             
-            u_t = u_data[t:t+1].view(-1)
-            v_t = v_data[t:t+1].view(-1)
-
-            u_rot, v_rot = self.rotate_data(u_t, v_t)
-            u_rot = torch.clamp(u_rot, 1e-9, 1 - 1e-9)
-            v_rot = torch.clamp(v_rot, 1e-9, 1 - 1e-9)
+            u_rot, v_rot = u_all[t], v_all[t]
             
             if 'gaussian' in self.family:
                 rho = theta_t
-                n = torch.distributions.Normal(0, 1)
-                x = n.icdf(u_rot)
-                y = n.icdf(v_rot)
+                x, y = x_all[t], y_all[t]
                 score = rho + (x * y * (1 + rho**2) - rho * (x**2 + y**2)) / (1 - rho**2 + 1e-8)
                 score = score.view(-1)
                 
             elif 'student' in self.family:
                 rho = theta_t
-                x = inverse_t_cdf(u_rot, nu)
-                y = inverse_t_cdf(v_rot, nu)
+                x, y = x_all[t], y_all[t]
                 zeta = (x**2 - 2*rho*x*y + y**2) / (1 - rho**2 + 1e-8)
                 w_t = (nu + 2) / (nu + zeta)
                 score = rho + w_t * (x * y * (1 + rho**2) - rho * (x**2 + y**2)) / (1 - rho**2 + 1e-8)
                 score = score.view(-1)
 
             else:
+                # Archimedean: autograd score on original (unrotated) inputs
+                u_t = u_data[t:t+1].view(-1)
+                v_t = v_data[t:t+1].view(-1)
                 f_t_leaf = f_t.detach().requires_grad_(True)
                 theta_leaf = self.transform_parameter(f_t_leaf)
                 ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu).sum()
@@ -298,16 +308,20 @@ class GASPairCopula(nn.Module):
                 score_variance = alpha * score_variance + (1 - alpha) * (score_val**2)
                 scale = 1.0 / (torch.sqrt(score_variance) + 1e-8)
             
+            # Truncated BPTT: detach score to treat it as exogenous forcing
             scaled_score = score.detach() * scale
             scaled_score = torch.clamp(scaled_score, min=-10.0, max=10.0) 
             
             f_next = self.omega + self.A * scaled_score.squeeze() + B * (f_t - self.omega)
             
-            ll_connected = self.log_likelihood_pair(u_t, v_t, theta_t, nu).view(-1)
+            ll_connected = self.log_likelihood_pair(
+                u_data[t:t+1].view(-1), v_data[t:t+1].view(-1), theta_t, nu
+            ).view(-1)
             log_likes.append(ll_connected)
             
             f_t = f_next
-            
+        
+        self.oos_forecast = self.transform_parameter(f_t).detach()
         return -torch.sum(torch.stack(log_likes)), torch.stack(thetas)
 
 
@@ -334,9 +348,8 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5
         )
-        patience = 35 # Allow a bit of time to settle after aggressive decay
+        patience = 35
     else:
-        # Default for HAR
         optimizer = optim.Adam(model.parameters(), lr=0.005)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5
@@ -346,6 +359,8 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
     loss_hist = []
     max_epochs = 300
     best_loss = float('inf')
+    best_nll = float('inf')
+    best_state = None
     patience_counter = 0
 
     for epoch in range(max_epochs):
@@ -366,6 +381,8 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
         normalized_loss = current_loss / T
         if normalized_loss < best_loss - 1e-6:
             best_loss = normalized_loss
+            best_nll = current_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
@@ -373,6 +390,11 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
         if patience_counter >= patience:
             break
     
+    # Restore best weights
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    # Forward pass WITH gradients: Archimedean edges need autograd for the score
     _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
     theta_path = theta_path.detach().squeeze()
     theta_path = torch.nan_to_num(theta_path, nan=0.0)
@@ -380,14 +402,16 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
     nu_val = model.get_nu()
     if nu_val is not None: 
         nu_val = torch.nan_to_num(nu_val.detach(), nan=5.0)
-        
-    h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
-    h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
+    
+    # h-functions are pure inference — safe under no_grad
+    with torch.no_grad():
+        h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
+        h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
 
     if 'student' in fam_str: k = 4 
     else: k = 3 
     
-    final_nll = loss_hist[-1] if loss_hist else float('nan')
+    final_nll = best_nll if best_state is not None else (loss_hist[-1] if loss_hist else float('nan'))
     
     aic = 2 * k + 2 * final_nll
     bic = k * np.log(T) + 2 * final_nll
@@ -395,7 +419,8 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
     result_dict = {'loss_history': loss_hist, 'path': theta_path.numpy(),'family': fam_str, 'rotation': rotation,
                    'omega': model.omega.item(), 'A': model.A.item(), 'B': model.get_B().item(), 
                    'nu': nu_val.item() if nu_val is not None else float('nan'),
-                   'nll': final_nll, 'aic': aic, 'bic': bic}
+                   'nll': final_nll, 'aic': aic, 'bic': bic,
+                   'oos_forecast': model.oos_forecast.item()}
     
     return edge, partner_col, result_dict, h_direct, h_indirect
 
@@ -420,7 +445,7 @@ def fit_mixed_gas_vine(u_matrix, structure, model_type):
         h_storage[(i, -1)] = u_tensor[:, i]
 
     fitted_models = {}
-    active_cores = min(64, os.cpu_count() // 2)
+    active_cores = max(1, os.cpu_count() - 2)
     print(f"Parallelizing Vine Fitting across {active_cores} CPU cores...")
 
     for tree in range(N - 1):
@@ -465,7 +490,7 @@ def fit_mixed_gas_vine(u_matrix, structure, model_type):
             # Pass the model_type down to the worker thread
             tasks.append((tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, {'u': u_np, 'v': v_np}, T, model_type))
             
-        results = Parallel(n_jobs=48, return_as="generator")(delayed(fit_single_edge)(*t) for t in tasks)
+        results = Parallel(n_jobs=active_cores, return_as="generator")(delayed(fit_single_edge)(*t) for t in tasks)
 
         for res in tqdm(results, total=edges, desc=f"Tree {tree+1}/{N-1}"):
             edge_idx, partner_col, model_dict, h_dir, h_indir = res
