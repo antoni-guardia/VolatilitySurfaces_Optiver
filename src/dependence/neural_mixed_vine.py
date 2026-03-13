@@ -238,7 +238,7 @@ class NeuralPairCopula(nn.Module):
 # --- OPTUNA HYPERPARAMETER OPTIMIZATION ---
 # ====================================================================================
 def objective(trial, u_full, v_full, split_idx, fam_str, rotation, static_theta, static_nu):
-    hidden_dim = trial.suggest_categorical("hidden_dim", [1, 2, 4, 8, 16, 32])
+    hidden_dim = trial.suggest_categorical("hidden_dim", [1, 2, 4, 8])
     num_layers = trial.suggest_int("num_layers", 1, 2)
     dropout = trial.suggest_float("dropout", 0.0, 0.3) if num_layers == 2 else 0.0
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
@@ -650,6 +650,51 @@ def plot_neural_convergence(fitted_models, name, save_path):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
+def print_neural_short_summary(fitted_models):
+    total_nll = 0.0
+    total_aic = 0.0
+    total_bic = 0.0
+    
+    for info in fitted_models.values():
+        total_nll += info.get('nll', 0.0)
+        total_aic += info.get('aic', 0.0)
+        total_bic += info.get('bic', 0.0)
+        
+    log_likelihood = -total_nll
+    
+    print(f"\nIn-Sample Log-Likelihood: {log_likelihood:.2f}")
+    print(f"In-Sample AIC:            {total_aic:.2f}")
+    print(f"In-Sample BIC:            {total_bic:.2f}")
+
+def save_vine_summary_csv(fitted_models, save_path):
+    rows = []
+    total_nll, total_aic, total_bic = 0.0, 0.0, 0.0
+    
+    for edge_key, info in fitted_models.items():
+        if info['family'] == 'indep':
+            rows.append([edge_key, 'Indep', 0, 0.0, 0.0, 0.0])
+            continue
+            
+        # Neural models don't have explicit omega/A/B parameters like GAS, 
+        # so we just log the structural and fit metrics.
+        rows.append([
+            edge_key, 
+            info['family'].capitalize(), 
+            info['rotation'], 
+            info['nll'], 
+            info['aic'], 
+            info['bic']
+        ])
+        
+        total_nll += info['nll']
+        total_aic += info['aic']
+        total_bic += info['bic']
+        
+    df = pd.DataFrame(rows, columns=['Edge', 'Family', 'Rotation', 'NLL', 'AIC', 'BIC'])
+    totals_row = pd.DataFrame([['TOTAL', '-', '-', total_nll, total_aic, total_bic]], columns=df.columns)
+    df = pd.concat([df, totals_row], ignore_index=True)
+    df.to_csv(save_path, index=False)
+
 # ====================================================================================
 # --- MAIN EXECUTION ---
 # ====================================================================================
@@ -726,6 +771,10 @@ if __name__ == "__main__":
         
         # Save & Plot
         save_prefix = f"neural_vine_spot_{factor_name.lower().replace('-', '_')}"
+
+        print_neural_short_summary(neural_fitted_models)
+        csv_path = os.path.join(out_dir, f"{save_prefix}_summary.csv")
+        save_vine_summary_csv(neural_fitted_models, csv_path)
         
         plot_dynamic_tau_paths(neural_fitted_models, global_valid_dates, f"Neural {factor_name}", 
                                os.path.join(graph_dir, f"{save_prefix}_dynamic_tau.png"))
