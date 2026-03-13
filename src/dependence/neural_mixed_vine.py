@@ -532,7 +532,7 @@ def fit_neural_vine(u_matrix, structure, hpo_params):
     h_storage = {(i, -1): u_matrix[:, i] for i in range(N)}
     fitted_models = {}
     
-    active_cores = max(1, os.cpu_count() - 2)
+    active_cores = 46
     print(f"Parallelizing Neural Vine Fitting across {active_cores} CPU cores...")
 
     for tree in range(N - 1):
