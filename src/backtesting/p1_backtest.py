@@ -170,7 +170,9 @@ def main():
         df_unif_merged = pd.concat([df_unif_spot, df_unif_factor], axis=1).reindex(columns=valid_names).ffill().bfill()
         history_window = df_unif_merged.iloc[-60:].values 
         
-        static_base = os.path.join(RESULTS_DIR, "copulas", "static", "joint_vine_spot_har_garch_evt_model.json")
+        static_base_name = "joint_vine_spot_nsde_model.json" if args.model in ["M3", "M4"] else "joint_vine_spot_har_garch_evt_model.json"
+        static_base = os.path.join(RESULTS_DIR, "copulas", "static", static_base_name)
+        
         copula = DynamicVineWrapper(full_cop_path, static_base, history_window, "GAS" if args.model in ["M1", "M3"] else "Neural")
 
     generator = UniversalScenarioGenerator(valid_names, copula, args.model)
@@ -237,21 +239,65 @@ def main():
     vine_kup_p = kupiec_pof_test(vh, ALPHA)
     vine_cc_p, vine_ind_p, vine_uc_p = christoffersen_test(vh, ALPHA)
     vine_mf_stat, vine_mf_p, _ = mcneil_frey_test(rpnl, df_res['Vine_ES'].values, df_res['Vine_Std'].values, vh)
-    dm_stat, dm_pval, dm_diff = diebold_mariano_test(tick_loss(rpnl, df_res['Vine_VaR'].values, ALPHA), tick_loss(rpnl, df_res['Indep_VaR'].values, ALPHA), h=1)
-
-    print(f"\n{'='*60}")
-    print(f" BACKTEST COMPLETE: {args.model} | P1: RISK REVERSAL")
-    print(f"{'='*60}")
-    print(f" Vine Exceedances: {vh.sum()} | Target: {len(df_res)*ALPHA:.1f}")
-    print(f" Kupiec POF p-value: {vine_kup_p:.4f} (PASS if > {ALPHA})")
-    print(f" Christoffersen CC p-value: {vine_cc_p:.4f} (PASS if > {ALPHA})")
-    print(f" McNeil-Frey p-value: {vine_mf_p:.4f} (PASS if > {ALPHA})")
-    print(f" Diebold-Mariano p-value: {dm_pval:.4f}")
     
+    vine_tick = tick_loss(rpnl, df_res['Vine_VaR'].values, ALPHA)
+    indep_tick = tick_loss(rpnl, df_res['Indep_VaR'].values, ALPHA)
+    dm_stat, dm_pval, dm_diff = diebold_mariano_test(vine_tick, indep_tick, h=1)
+
+    print(f"\n{'='*80}")
+    print(f" BASEL 1-DAY OOS BACKTEST — FULL STATISTICAL SUITE ({args.model})")
+    print(f"{'='*80}")
+    print(f" Trading Days: {len(df_res)} | Target Exceedances: {len(df_res)*ALPHA:.1f} | Scenarios: {args.paths}")
+    print(f"\nTEST                                                   VINE             INDEP")
+    print(f"------------------------------------------------------------------------------")
+    print(f" Exceedances                                            {vh.sum():<17} {ih.sum()}")
+    print(f" Kupiec POF p-value                                 {vine_kup_p:.4f}           -")
+    print(f" Christoffersen CC p-value                          {vine_cc_p:.4f}           -")
+    print(f" McNeil-Frey p-value                                {vine_mf_p:.4f}           -")
+    print(f"\n --- Tick Loss ---")
+    print(f" Vine mean tick loss                                {vine_tick.mean():.2f}")
+    print(f" Indep mean tick loss                               {indep_tick.mean():.2f}")
+    print(f" Diebold-Mariano p-value                            {dm_pval:.4f}")
+    print(f"\n--- Realised P&L diagnostics ---")
+    print(f" Mean           {rpnl.mean():.0f}  |  Std           {rpnl.std():.0f}")
+    print(f" Min            {rpnl.min():.0f}  |  Max           {rpnl.max():.0f}")
+    print(f" Vine  VaR mean {df_res['Vine_VaR'].mean():.0f}  |  ES mean       {df_res['Vine_ES'].mean():.0f}")
+    print(f" Indep VaR mean {df_res['Indep_VaR'].mean():.0f}  |  ES mean       {df_res['Indep_ES'].mean():.0f}")
+    print(f"{'='*80}")
+    
+    # Save CSV
     os.makedirs(os.path.join(RESULTS_DIR, "backtests"), exist_ok=True)
     out_path = os.path.join(RESULTS_DIR, "backtests", f"p1_results_{args.model}.csv")
     df_res.to_csv(out_path, index=False)
-    print(f" Saved to {out_path}")
+    print(f" Saved data to {out_path}")
+
+    # --- GENERATE VAR EXCEEDANCE PLOT ---
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+    plt.figure(figsize=(12, 6))
+    
+    dates = pd.to_datetime(df_res['Date'])
+    plt.plot(dates, df_res['Realized_PnL'], label="Realised P&L", color="black", alpha=0.6, lw=1.5)
+    plt.plot(dates, df_res['Vine_VaR'], label=f"Vine VaR (95%)", color="#d62728", lw=2)
+    plt.plot(dates, df_res['Indep_VaR'], label=f"Indep VaR (95%)", color="#1f77b4", lw=2, linestyle="--")
+    
+    # Highlight Vine Exceedances
+    exceed_mask = df_res['Vine_Hit'] == 1
+    plt.scatter(dates[exceed_mask], df_res['Realized_PnL'][exceed_mask], 
+                color="red", zorder=5, label="Vine Exceedance", marker="x", s=50)
+
+    plt.title(f"1-Day Out-of-Sample Portfolio 1 P&L vs Value-at-Risk ({args.model})", fontweight="bold")
+    plt.ylabel("Portfolio P&L ($)")
+    plt.xlabel("Date")
+    plt.legend(loc="best", frameon=True)
+    plt.tight_layout()
+    
+    plot_path = os.path.join(RESULTS_DIR, "backtests", f"p1_var_plot_{args.model}.png")
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
+    print(f" Saved plot to {plot_path}")
 
 if __name__ == "__main__":
     main()

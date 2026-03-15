@@ -80,8 +80,16 @@ class DynamicVineWrapper:
                     h_storage[(edge, tree)] = u_vec
                     if tree < self.N - 2: h_storage[(partner_col, tree)] = v_vec
                 else:
+                    # --- FIX 2: CONDITIONAL AUTOGRAD FOR GAS ---
+                    if hasattr(m, 'rnn'): # Neural Copula
+                        with torch.no_grad():
+                            _, theta_seq = m(u_vec, v_vec)
+                    else: # GAS Copula (Requires internal autograd for Archimedean score)
+                        with torch.enable_grad():
+                            _, theta_seq = m(u_vec, v_vec)
+                            
                     with torch.no_grad():
-                        _, theta_seq = m(u_vec, v_vec)
+                        theta_seq = theta_seq.detach()
                         nu = m.get_nu()
                         h_dir = m.compute_h_func(u_vec, v_vec, theta_seq.squeeze(), nu)
                         h_indir = m.compute_h_func(v_vec, u_vec, theta_seq.squeeze(), nu)
@@ -92,16 +100,40 @@ class DynamicVineWrapper:
         self._push_to_cpp()
 
     def _push_to_cpp(self):
+        # 1. Extract the full nested list of pair copulas
+        pcs = self.base_copula.pair_copulas 
+        
         for tree in range(self.N - 1):
             for edge in range(self.N - 1 - tree):
                 m = self.models[f"T{tree}_E{edge}"]
                 if m:
-                    theta_oos = float(m.oos_forecast.item())
-                    nu = m.get_nu()
-                    params = np.array([[theta_oos], [float(nu.item())]]) if nu is not None else np.array([[theta_oos]])
-                    self.base_copula.get_pair_copula(tree, edge).parameters = params
-
-
+                    theta_oos = float(m.transform_parameter(m.oos_forecast).item())
+                    pc = pcs[tree][edge] # Access the exact Bicop object in the list
+                    
+                    if pc.parameters.shape[0] == 2:
+                        nu = m.get_nu()
+                        nu_val = float(nu.item()) if nu is not None else 5.0
+                        theta_oos = np.clip(theta_oos, -0.999, 0.999)
+                        params = np.array([[theta_oos], [nu_val]])
+                    else:
+                        if any(f in m.family for f in ['gaussian', 'student']):
+                            theta_oos = np.clip(theta_oos, -0.999, 0.999)
+                        elif 'frank' in m.family:
+                            theta_oos = np.clip(theta_oos, -40.0, 40.0)
+                            if abs(theta_oos) < 1e-4: theta_oos = 1e-4 
+                        elif 'clayton' in m.family:
+                            theta_oos = np.clip(theta_oos, 1e-5, 28.0)
+                        elif 'gumbel' in m.family:
+                            theta_oos = np.clip(theta_oos, 1.001, 28.0)
+                            
+                        params = np.array([[theta_oos]])
+                        
+                    # Modify the Bicop IN THE LIST
+                    pcs[tree][edge].parameters = params
+                    
+        # 2. RE-INSTANTIATE THE VINECOP to force C++ to register the new parameters!
+        self.base_copula = pv.Vinecop(self.matrix, pcs)
+        
 class UniversalScenarioGenerator:
     def __init__(self, factor_order, copula_model, model_id):
         self.factor_order = factor_order
