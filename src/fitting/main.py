@@ -48,4 +48,5 @@ def main():
     print("="*60)
 
 if __name__ == "__main__":
+    np.seed(1714)
     main()

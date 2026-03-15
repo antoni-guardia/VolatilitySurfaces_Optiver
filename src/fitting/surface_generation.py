@@ -75,7 +75,8 @@ class SurfaceGenerator:
                     print(f"[{symbol}] Day {idx+1}/{n_days} | Elapsed: {elapsed:.1f}m | ETA: {remaining:.1f}m", flush=True)
 
             except Exception as e:
-                continue # Skip un-fittable days gracefully
+                print(f"[{symbol}] Day {idx+1}/{n_days} ({qd}) — skipped: {e}", flush=True)
+                continue # Skip unfittable days
 
         # 3. Export Data
         if symbol_slices:
@@ -96,8 +97,7 @@ class SurfaceGenerator:
         """Deploys the workload across all available CPU cores."""
         print(f"[*] Deploying SSVI Calibration across {cpu_count()} cores for {len(self.symbols)} symbols...")
         
-        # Spin up multiprocessing pool. 
-        # maxtasksperchild=1 strictly prevents memory leaks in SciPy optimization loops
+        # Spin up multiprocessing pool
         with Pool(processes=cpu_count(), maxtasksperchild=1) as pool:
             results = pool.map(self._process_symbol_worker, self.symbols)
             

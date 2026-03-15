@@ -17,6 +17,97 @@ from src.compression.helpers.data_preparation import get_clean_4d_tensor
 from src.compression.helpers.visualisation_function import plot_surfaces_for_latex
 from src.compression.helpers.reconstruction import Reconstruction
 
+
+def print_header(title):
+    print(f"\n{SEP2}\n {title.upper().center(WIDTH-2)}\n{SEP2}")
+
+def print_section(title):
+    print(f"\n{SEP1}\n {title}\n{SEP1}")
+
+def print_asset_local_table(symbol, 
+                            r2_g_tr, r2_a_tr, r2_o_tr, r2_l_tr, 
+                            r2_g_fu, r2_a_fu, r2_o_fu, r2_l_fu, 
+                            pc_ratios, r2_ks_tr, r2_ks_fu):
+        
+    top_line = f"─ {symbol} "
+    pad_len = WIDTH - len(top_line) - 2
+        
+    print(f"\n┌{top_line}{'─' * pad_len}┐")
+    print(f"│ {'Metric':<31} │ {'R² (Train)':>10} │ {'R² (Full)':>10} │ {'% of Resid':>12} │")
+    print(f"├{'─'*33}┼{'─'*12}┼{'─'*12}┼{'─'*14}┤")
+        
+    print(f"│ {'Grand Mean only':<31} │ {r2_g_tr:>10.4f} │ {r2_g_fu:>10.4f} │ {'—':>12} │")
+    print(f"│ {'+ Asset Bias':<31} │ {r2_a_tr:>10.4f} │ {r2_a_fu:>10.4f} │ {'—':>12} │")
+    print(f"│ {'+ Global (surface β, no int.)':<31} │ {r2_o_tr:>10.4f} │ {r2_o_fu:>10.4f} │ {'—':>12} │")
+
+    for k, (ratio, r2_tr, r2_fu) in enumerate(zip(pc_ratios, r2_ks_tr, r2_ks_fu)):
+        print(f"│ {'+ Local PC ' + str(k+1):<31} │ {r2_tr:>10.4f} │ {r2_fu:>10.4f} │ {ratio*100:>11.1f}% │")
+
+    print(f"├{'─'*33}┼{'─'*12}┼{'─'*12}┼{'─'*14}┤")
+    print(f"│ {'Total Explained (All PCs)':<31} │ {r2_l_tr:>10.4f} │ {r2_l_fu:>10.4f} │ {'—':>12} │")
+    print(f"│ {'Unexplained Residual':<31} │ {1.0 - r2_l_tr:>10.4f} │ {1.0 - r2_l_fu:>10.4f} │ {'—':>12} │")
+    print(f"└{'─'*74}┘")
+    
+def print_idiosyncrasy_diagnostic(local_scores_dict, global_scores, n_pc_global):
+    symbols  = list(local_scores_dict.keys())
+    N_ASSETS = len(symbols)
+    n_local  = local_scores_dict[symbols[0]].shape[1]
+
+    # ── Part 1: local scores vs global scores ────────────────────────
+    print(f"\n  ┌─ Part 1 : Temporal Orthogonality  corr(ξ_jm=1, z_k) {'─'*14}┐")
+    print(f"  │  Guaranteed ≈ 0 by OLS — sanity check.                             │")
+    print(f"  │  Action only if max |corr| > 0.10                                  │")
+    print(f"  │                                                                    │")
+    print(f"  │  {'':>6}" + "".join(f"{'z_' + str(k+1):>8}" for k in range(n_pc_global)) + "  │")
+    print(f"  │  {'─'*6}" + "".join("─"*8 for _ in range(n_pc_global)) + "  │")
+
+    max_part1 = 0.0
+    for sym in symbols:
+        scores_j = local_scores_dict[sym]
+        row = f"  │  {sym:<6}"
+        for k in range(n_pc_global):
+            c = np.corrcoef(scores_j[:, 0], global_scores[:, k])[0, 1]
+            max_part1 = max(max_part1, abs(c))
+            row += f"{c:>8.3f}"
+        row += "  │"
+        print(row)
+
+    verdict_p1 = ("✓ clean" if max_part1 < 0.10 else "✗ leakage — increase N_PC_GLOBAL")
+    print(f"  │                                                                    │")
+    print(f"  │  Max |corr| = {max_part1:.3f}   {verdict_p1:<40}   │")
+    print(f"  └{'─' * 66}┘")
+
+    # ── Part 2: cross-asset local PC correlations ────────────────────
+    print(f"\n  ┌─ Part 2 : Cross-Asset Local Score Correlation {'─'*16}┐")
+    print(f"  │  Dependence signal — feed directly to copula.                      │")
+    print(f"  │  High values are expected and desirable, NOT a problem.            │")
+
+    for m in range(n_local):
+        pc_m_matrix = np.column_stack([local_scores_dict[sym][:, m] for sym in symbols])
+        C = np.corrcoef(pc_m_matrix.T)
+        np.fill_diagonal(C, np.nan)
+        abs_C = np.abs(C)
+
+        max_corr  = np.nanmax(abs_C)
+        mean_corr = np.nanmean(abs_C)
+        p95_corr  = np.nanpercentile(abs_C, 95)
+
+        print(f"  │                                                                    │")
+        print(f"  │  Local PC {m+1}   max={max_corr:.3f}  mean={mean_corr:.3f}  p95={p95_corr:.3f}{'':>20}│")
+        print(f"  │  {'':>6}" + "".join(f"{s:>8}" for s in symbols) + "  │")
+        print(f"  │  {'─'*6}" + "".join("─"*8 for _ in symbols) + "  │")
+
+        for i, sym in enumerate(symbols):
+            row = f"  │  {sym:<6}"
+            for jj in range(N_ASSETS):
+                val = C[i, jj]
+                row += f"{'—':>8}" if np.isnan(val) else f"{val:>8.3f}"
+            row += "  │"
+            print(row)
+
+    print(f"  └{'─' * 66}┘")
+
+
 if __name__ == "__main__":
     # --- Configuration ---
     n_pc_global   = g.N_PC_GLOBAL
@@ -24,8 +115,7 @@ if __name__ == "__main__":
     plot_surfaces = True
     train_slice   = slice(None, g.JAN_2025)
     np.random.seed(42)
-    random.seed(42)
-
+    
     X_original = get_clean_4d_tensor()
     N_OBS, N_ASSETS, N_MAT, N_MON = X_original.shape
     
@@ -38,94 +128,7 @@ if __name__ == "__main__":
     SEP2 = "═" * WIDTH
     SEP1 = "─" * WIDTH
 
-    def print_header(title):
-        print(f"\n{SEP2}\n {title.upper().center(WIDTH-2)}\n{SEP2}")
-
-    def print_section(title):
-        print(f"\n{SEP1}\n {title}\n{SEP1}")
-
-    def print_asset_local_table(symbol, 
-                                r2_g_tr, r2_a_tr, r2_o_tr, r2_l_tr, 
-                                r2_g_fu, r2_a_fu, r2_o_fu, r2_l_fu, 
-                                pc_ratios, r2_ks_tr, r2_ks_fu):
-        
-        top_line = f"─ {symbol} "
-        pad_len = WIDTH - len(top_line) - 2
-        
-        print(f"\n┌{top_line}{'─' * pad_len}┐")
-        print(f"│ {'Metric':<31} │ {'R² (Train)':>10} │ {'R² (Full)':>10} │ {'% of Resid':>12} │")
-        print(f"├{'─'*33}┼{'─'*12}┼{'─'*12}┼{'─'*14}┤")
-        
-        print(f"│ {'Grand Mean only':<31} │ {r2_g_tr:>10.4f} │ {r2_g_fu:>10.4f} │ {'—':>12} │")
-        print(f"│ {'+ Asset Bias':<31} │ {r2_a_tr:>10.4f} │ {r2_a_fu:>10.4f} │ {'—':>12} │")
-        print(f"│ {'+ Global (surface β, no int.)':<31} │ {r2_o_tr:>10.4f} │ {r2_o_fu:>10.4f} │ {'—':>12} │")
-
-        for k, (ratio, r2_tr, r2_fu) in enumerate(zip(pc_ratios, r2_ks_tr, r2_ks_fu)):
-            print(f"│ {'+ Local PC ' + str(k+1):<31} │ {r2_tr:>10.4f} │ {r2_fu:>10.4f} │ {ratio*100:>11.1f}% │")
-
-        print(f"├{'─'*33}┼{'─'*12}┼{'─'*12}┼{'─'*14}┤")
-        print(f"│ {'Total Explained (All PCs)':<31} │ {r2_l_tr:>10.4f} │ {r2_l_fu:>10.4f} │ {'—':>12} │")
-        print(f"│ {'Unexplained Residual':<31} │ {1.0 - r2_l_tr:>10.4f} │ {1.0 - r2_l_fu:>10.4f} │ {'—':>12} │")
-        print(f"└{'─'*74}┘")
     
-    def print_idiosyncrasy_diagnostic(local_scores_dict, global_scores, n_pc_global):
-        symbols  = list(local_scores_dict.keys())
-        N_ASSETS = len(symbols)
-        n_local  = local_scores_dict[symbols[0]].shape[1]
-
-        # ── Part 1: local scores vs global scores ────────────────────────
-        print(f"\n  ┌─ Part 1 : Temporal Orthogonality  corr(ξ_jm=1, z_k) {'─'*14}┐")
-        print(f"  │  Guaranteed ≈ 0 by OLS — sanity check.                             │")
-        print(f"  │  Action only if max |corr| > 0.10                                  │")
-        print(f"  │                                                                    │")
-        print(f"  │  {'':>6}" + "".join(f"{'z_' + str(k+1):>8}" for k in range(n_pc_global)) + "  │")
-        print(f"  │  {'─'*6}" + "".join("─"*8 for _ in range(n_pc_global)) + "  │")
-
-        max_part1 = 0.0
-        for sym in symbols:
-            scores_j = local_scores_dict[sym]
-            row = f"  │  {sym:<6}"
-            for k in range(n_pc_global):
-                c = np.corrcoef(scores_j[:, 0], global_scores[:, k])[0, 1]
-                max_part1 = max(max_part1, abs(c))
-                row += f"{c:>8.3f}"
-            row += "  │"
-            print(row)
-
-        verdict_p1 = ("✓ clean" if max_part1 < 0.10 else "✗ leakage — increase N_PC_GLOBAL")
-        print(f"  │                                                                    │")
-        print(f"  │  Max |corr| = {max_part1:.3f}   {verdict_p1:<40}   │")
-        print(f"  └{'─' * 66}┘")
-
-        # ── Part 2: cross-asset local PC correlations ────────────────────
-        print(f"\n  ┌─ Part 2 : Cross-Asset Local Score Correlation {'─'*16}┐")
-        print(f"  │  Dependence signal — feed directly to copula.                      │")
-        print(f"  │  High values are expected and desirable, NOT a problem.            │")
-
-        for m in range(n_local):
-            pc_m_matrix = np.column_stack([local_scores_dict[sym][:, m] for sym in symbols])
-            C = np.corrcoef(pc_m_matrix.T)
-            np.fill_diagonal(C, np.nan)
-            abs_C = np.abs(C)
-
-            max_corr  = np.nanmax(abs_C)
-            mean_corr = np.nanmean(abs_C)
-            p95_corr  = np.nanpercentile(abs_C, 95)
-
-            print(f"  │                                                                    │")
-            print(f"  │  Local PC {m+1}   max={max_corr:.3f}  mean={mean_corr:.3f}  p95={p95_corr:.3f}{'':>20}│")
-            print(f"  │  {'':>6}" + "".join(f"{s:>8}" for s in symbols) + "  │")
-            print(f"  │  {'─'*6}" + "".join("─"*8 for _ in symbols) + "  │")
-
-            for i, sym in enumerate(symbols):
-                row = f"  │  {sym:<6}"
-                for jj in range(N_ASSETS):
-                    val = C[i, jj]
-                    row += f"{'—':>8}" if np.isnan(val) else f"{val:>8.3f}"
-                row += "  │"
-                print(row)
-
-        print(f"  └{'─' * 66}┘")
 
         # ===== Step 1: Functional ANOVA Decomposition =====
     print_section("Step 1: Functional ANOVA Decomposition (Train Only)")
