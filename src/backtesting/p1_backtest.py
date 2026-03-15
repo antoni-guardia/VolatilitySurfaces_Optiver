@@ -76,12 +76,14 @@ def main():
     OOS_END     = pd.Timestamp("2025-12-29")
 
     # 1. DYNAMIC PATH RESOLUTION 
+    SPOT_MARG_PATH = os.path.join("dynamics", "NGARCH", "fitted_marginals.pkl")
+
     if args.model in ["M0", "M1", "M2"]:
         marg_model_name = "HAR_GARCH"
     else:
         marg_model_name = "NSDE"
         
-    MARG_PATH = os.path.join("dynamics", marg_model_name, "fitted_marginals.pkl")
+    FACTOR_MARG_PATH = os.path.join("dynamics", marg_model_name, "fitted_marginals.pkl")
 
     COP_DICT = {
         "M0": "joint_vine_spot_har_garch_evt_model.json",
@@ -96,8 +98,13 @@ def main():
     df_factors = pd.read_csv(os.path.join(RESULTS_DIR, "factors", "hierarchical_all_factors.csv"), index_col=0, parse_dates=True)
     df_returns = pd.read_csv(os.path.join(DATA_DIR, "returns.csv"), index_col=0, parse_dates=True)
     
-    with open(os.path.join(RESULTS_DIR, MARG_PATH), "rb") as f:
-        marginals = RiskModelUnpickler(f).load()
+    with open(os.path.join(RESULTS_DIR, SPOT_MARG_PATH), "rb") as f:
+        spot_marginals = RiskModelUnpickler(f).load()
+        
+    with open(os.path.join(RESULTS_DIR, FACTOR_MARG_PATH), "rb") as f:
+        factor_marginals = RiskModelUnpickler(f).load()
+    
+    marginals = {**spot_marginals, **factor_marginals}
 
     with open(os.path.join(RESULTS_DIR, "factors", "surfaces_dict.pkl"), "rb") as f:
         surfaces_dict = pickle.load(f)
