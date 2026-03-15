@@ -9,16 +9,18 @@ def bs_price_vec(S, K, T, sigma, r, option_type):
     
     if not np.any(mask): return price
     
-    sqrt_T = np.sqrt(T) if isinstance(T, float) else np.sqrt(T[mask])
+    # FIX: Safely check if T is a scalar using np.ndim
+    T_mask = T if np.ndim(T) == 0 else T[mask]
+    sqrt_T = np.sqrt(T_mask)
     sig_mask = sigma[mask]
     
-    d1 = (np.log(S[mask] / K) + (r + 0.5 * sig_mask**2) * T) / (sig_mask * sqrt_T)
+    d1 = (np.log(S[mask] / K) + (r + 0.5 * sig_mask**2) * T_mask) / (sig_mask * sqrt_T)
     d2 = d1 - sig_mask * sqrt_T
     
     if option_type == 'C':
-        val = S[mask] * norm.cdf(d1) - K * np.exp(-r*T) * norm.cdf(d2)
+        val = S[mask] * norm.cdf(d1) - K * np.exp(-r * T_mask) * norm.cdf(d2)
     else:
-        val = K * np.exp(-r*T) * norm.cdf(-d2) - S[mask] * norm.cdf(-d1)
+        val = K * np.exp(-r * T_mask) * norm.cdf(-d2) - S[mask] * norm.cdf(-d1)
         
     price[mask] = np.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0)
     return price
@@ -31,8 +33,12 @@ def bs_delta_vec(S, K, T, sigma, r, option_type):
     
     if not np.any(mask): return delta
     
-    d1 = (np.log(S[mask] / K) + (r + 0.5 * sigma[mask]**2) * T) / (sigma[mask] * np.sqrt(T))
+    T_mask = T if np.ndim(T) == 0 else T[mask]
+    sig_mask = sigma[mask]
+    
+    d1 = (np.log(S[mask] / K) + (r + 0.5 * sig_mask**2) * T_mask) / (sig_mask * np.sqrt(T_mask))
     val = norm.cdf(d1) if option_type == 'C' else norm.cdf(d1) - 1.0
+    
     delta[mask] = np.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0)
     return delta
 

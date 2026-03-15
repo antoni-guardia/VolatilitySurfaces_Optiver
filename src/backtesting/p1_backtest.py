@@ -11,6 +11,12 @@ import pyvinecopulib as pv
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path: sys.path.insert(0, PROJECT_ROOT)
 
+_real_torch_load = torch.load
+def _cpu_safe_load(*args, **kwargs):
+    kwargs.setdefault('map_location', 'cpu')
+    return _real_torch_load(*args, **kwargs)
+torch.load = _cpu_safe_load
+
 from src.dynamics.HAR_GARCH import HAR_GARCH_EVT
 from src.dynamics.NeuralSDE import NeuralSDE
 from src.dynamics.NGARCH_T import NGARCH_T
@@ -131,20 +137,21 @@ def main():
 
     # 3. COPULA & GENERATOR SETUP
     full_cop_path = os.path.join(RESULTS_DIR, COP_PATH)
-    
+
     if args.model == "M0":
         copula = pv.Vinecop.from_file(full_cop_path)
     else:
-        # Load Warmup Uniforms for the Rolling Window
+        # Load Uniform Files for Warmup
+        unif_filename = "uniforms_nsde_train.csv" if args.model in ["M3", "M4"] else "uniforms_har_garch_evt_train.csv"
         unif_dir = os.path.join(RESULTS_DIR, "dynamics", "NSDE" if args.model in ["M3", "M4"] else "HAR_GARCH")
-        df_unif = pd.read_csv(os.path.join(unif_dir, "uniforms_train.csv"), index_col=0, parse_dates=True)
-        df_spot = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "NGARCH", "uniforms_train.csv"), index_col=0, parse_dates=True)
-        df_unif = pd.concat([df_spot, df_unif], axis=1).reindex(columns=valid_names).ffill().bfill()
         
-        history_window = df_unif.iloc[-60:].values 
+        df_unif_factor = pd.read_csv(os.path.join(unif_dir, unif_filename), index_col=0, parse_dates=True)
+        df_unif_spot   = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "NGARCH", "uniforms_ngarch_train.csv"), index_col=0, parse_dates=True)
+        
+        df_unif_merged = pd.concat([df_unif_spot, df_unif_factor], axis=1).reindex(columns=valid_names).ffill().bfill()
+        history_window = df_unif_merged.iloc[-60:].values 
+        
         static_base = os.path.join(RESULTS_DIR, "copulas", "static", "joint_vine_spot_har_garch_evt_model.json")
-        
-        # Use our new Wrapper that handles both GAS and Neural
         copula = DynamicVineWrapper(full_cop_path, static_base, history_window, "GAS" if args.model in ["M1", "M3"] else "Neural")
 
     generator = UniversalScenarioGenerator(valid_names, copula, args.model)
