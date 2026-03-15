@@ -53,8 +53,9 @@ class SSVI:
 
     def _no_calendar_shape_constraint(self, params):
         """Gatheral-Jacquier condition to prevent Calendar arbitrage."""
-        rho, eta, gamma = params
-        if abs(rho) >= 1.0: return -1.0 # Invalid correlation
+        rho, _, gamma = params
+        if abs(rho) >= 1.0: # Invalid correlation
+            return -1.0
         return (1.0 + np.sqrt(1.0 - rho**2)) - rho**2 * (1.0 - gamma)
 
     def _objective_smile(self, params, theta, k, T, iv_mkt):
@@ -63,68 +64,115 @@ class SSVI:
         phi = self._phi_power_law(theta, eta, gamma)
         w_model = self._ssvi_surface(k, theta, rho, phi)
         iv_model = np.sqrt(np.maximum(w_model, 1e-9) / T)
-        return np.sum((iv_model - iv_mkt)**2) * 1e4 # Scale up for optimizer sensitivity
+        return np.sum((iv_model - iv_mkt)**2) * 1e4 
 
     # --- 3. CALIBRATION ENGINE ---
     def fit(self, max_iter=10000):
         """Fits the SSVI surface slice-by-slice across maturities."""
-        k_all = self.df['log_moneyness'].values
-        T_all = self.df['tau'].values
+        k_all  = self.df['log_moneyness'].values
+        T_all  = self.df['tau'].values
         iv_all = self.df['implied_volatility'].values
         
         unique_T = np.sort(self.df['tau'].unique())
-        
-        theta_map, rho_map, eta_map, gamma_map = {}, {}, {}, {}
-        last_params = np.array([-0.5, 0.5, 0.5]) # Initial guess [rho, eta, gamma]
 
-        for i, T in enumerate(unique_T):
+        # Step 1: Extract raw ATM total variances (theta)
+        theta_map_raw = {}
+        valid_Ts      = []
+
+        for T in unique_T:
             mask = T_all == T
-            k = k_all[mask]
+            k    = k_all[mask]
 
-            # Require at least 5 strikes to fit a reliable smile
             if len(k) > 5:
-                iv_mkt = iv_all[mask]
-                w_mkt_slice = (iv_mkt**2) * T
-                
-                # Interpolate ATM variance (theta)
+                iv_mkt      = iv_all[mask]
+                w_mkt_slice = (iv_mkt ** 2) * T
+
                 if (k <= 0).any() and (k > 0).any():
                     theta = np.interp(0.0, k, w_mkt_slice)
                 else:
                     theta = w_mkt_slice[np.argmin(np.abs(k))]
 
-                bounds = [(-0.999, 0.999), (1e-6, 4.0), (0.0, 1.0)]
-                constraints = [
-                    {"type": "ineq", "fun": lambda p, t=theta: self._no_butterfly_constraint(t, p)},
-                    {"type": "ineq", "fun": lambda p: self._no_calendar_shape_constraint(p)}
-                ]
+                theta_map_raw[T] = theta
+                valid_Ts.append(T)
 
-                # Use Differential Evolution for the first slice to avoid local minima
-                if i == 0:
-                    res = differential_evolution(self._objective_smile, bounds=bounds, args=(theta, k, T, iv_mkt))
-                else:
-                    res = minimize(
-                        self._objective_smile, last_params, args=(theta, k, T, iv_mkt),
-                        method="SLSQP", bounds=bounds, constraints=constraints,
-                        options={"ftol": 1e-12, "maxiter": max_iter}
-                    )
+        if not theta_map_raw:
+            raise ValueError(
+                f"SSVI Fit failed entirely for {self.symbol} on {self.quote_datetime}"
+            )
 
-                if res.success and abs(res.x[0]) < 0.99:
-                    last_params = res.x
-                    theta_map[T] = theta
-                    rho_map[T], eta_map[T], gamma_map[T] = res.x
+        # Step 2: Enforce ATM variance monotonicity
+        
+        Ts           = np.array(sorted(theta_map_raw.keys()))
+        thetas_raw   = np.array([theta_map_raw[T] for T in Ts])
+        iso          = IsotonicRegression(increasing=True)
+        thetas_mono  = iso.fit_transform(Ts, thetas_raw)
+        theta_map    = {T: thetas_mono[i] for i, T in enumerate(Ts)}
 
-        if not theta_map:
-            raise ValueError(f"SSVI Fit failed entirely for {self.symbol} on {self.quote_datetime}")
+        # Step 3: Calibrate smile parameters
+        rho_map, eta_map, gamma_map = {}, {}, {}
+        last_params = np.array([-0.5, 0.5, 0.5])   # [rho, eta, gamma]
 
-        # Enforce strict Monotonicity of ATM Variance (No Calendar Arbitrage)
-        Ts = np.array(sorted(theta_map.keys()))
-        thetas = np.array([theta_map[T] for T in Ts])
-        iso = IsotonicRegression(increasing=True)
-        thetas_mono = iso.fit_transform(Ts, thetas)
-        theta_map = {T: thetas_mono[i] for i, T in enumerate(Ts)}
+        for i, T in enumerate(Ts):
+            mask   = T_all == T
+            k      = k_all[mask]
+            iv_mkt = iv_all[mask]
+            theta  = theta_map[T]
 
-        self.res = {"theta": theta_map, "rho": rho_map, "eta": eta_map, "gamma": gamma_map, "maturities": Ts}
+            bounds = [
+                (-1 + 1e-6,  1 - 1e-6),            # rho  ∈ (-1, 1)
+                (1e-6,       4.0),                  # eta  > 0
+                (1e-6,       1.0),                  # gamma ∈ (0, 1)
+            ]
+            constraints = [
+                {
+                    "type": "ineq",
+                    "fun": lambda p, t=theta: self._no_butterfly_constraint(t, p)
+                },
+                {
+                    "type": "ineq",
+                    "fun": lambda p: self._no_calendar_shape_constraint(p)
+                },
+            ]
+
+            # Differential Evolution for the first slice to avoid local optima;
+            # warm-started SLSQP for all subsequent slices for speed and continuity.
+            if i == 0:
+                res = differential_evolution(
+                    self._objective_smile,
+                    bounds=bounds,
+                    args=(theta, k, T, iv_mkt),
+                )
+            else:
+                res = minimize(
+                    self._objective_smile,
+                    last_params,
+                    args=(theta, k, T, iv_mkt),
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints=constraints,
+                    options={"ftol": 1e-12, "maxiter": max_iter},
+                )
+
+            if res.success and abs(res.x[0]) < 0.99:
+                last_params         = res.x
+                rho_map[T]          = res.x[0]
+                eta_map[T]          = res.x[1]
+                gamma_map[T]        = res.x[2]
+
+        if not rho_map:
+            raise ValueError(
+                f"SSVI Fit: no slice converged for {self.symbol} on {self.quote_datetime}"
+            )
+
+        self.res = {
+            "theta":      theta_map,
+            "rho":        rho_map,
+            "eta":        eta_map,
+            "gamma":      gamma_map,
+            "maturities": np.array(sorted(rho_map.keys())),
+        }
         self._compile_surface()
+
         return self
 
     def _compile_surface(self):
@@ -149,7 +197,6 @@ class SSVI:
             for i in range(len(Ts))
         ])
 
-    # --- 4. EXPOSED PRICING & VOLATILITY METHODS ---
     def total_variance(self, T, k):
         """Calculates total variance w(T, k) using Lemma 5.1 linear interpolation."""
         s = self._surface
