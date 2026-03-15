@@ -46,6 +46,7 @@ class DynamicVineWrapper:
                         m.load_state_dict(info['state_dict'])
                         
                 m.eval()
+                m.oos_forecast = torch.tensor(info.get('oos_forecast', 0.0))
                 self.models[edge_key] = m
                 
         self._push_to_cpp()

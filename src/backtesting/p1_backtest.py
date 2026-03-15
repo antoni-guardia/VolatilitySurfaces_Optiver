@@ -110,7 +110,26 @@ def main():
     with open(os.path.join(RESULTS_DIR, FACTOR_MARG_PATH), "rb") as f:
         factor_marginals = RiskModelUnpickler(f).load()
     
-    marginals = {**spot_marginals, **factor_marginals}
+    # Initialize marginals with the spot NGARCH models
+    marginals = {**spot_marginals}
+
+    # --- MELVIN'S SAFE NSDE REHYDRATION ---
+    if args.model in ["M3", "M4"]:
+        replace_count = 0
+        for k, v in factor_marginals.items():
+            if k in marginals:
+                replace_count += 1
+            if isinstance(v, dict) and 'state_dict' in v:
+                m = NeuralSDE(v['params'], device='cpu')
+                m.load_state_dict(v['state_dict'])
+                m.eval()
+                marginals[k] = m
+            else: 
+                marginals[k] = v
+        print(f"[+] Successfully rehydrated {len(factor_marginals)} NSDE marginals.")
+    else:
+        # For M0, M1, M2 (HAR-GARCH), just merge the dictionaries directly
+        marginals.update(factor_marginals)
 
     with open(os.path.join(RESULTS_DIR, "factors", "surfaces_dict.pkl"), "rb") as f:
         surfaces_dict = pickle.load(f)
