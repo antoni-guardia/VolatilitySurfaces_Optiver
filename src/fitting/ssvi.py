@@ -188,7 +188,7 @@ class SSVI:
         self._surface["sqrt_theta"] = np.sqrt(self._surface["theta"])
         
         # Forward Price Interpolator
-        F_map = self.df.groupby("tau")["underlying_price"].mean().loc[Ts].values # Ensure underlying_price maps correctly
+        F_map = self.df.groupby("tau")["underlying_mid_price"].mean().loc[Ts].values
         self._surface["F"] = F_map
         self._forward_interp = interp1d(Ts, F_map, kind="linear", fill_value="extrapolate")
 

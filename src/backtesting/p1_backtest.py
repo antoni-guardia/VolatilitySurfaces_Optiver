@@ -69,7 +69,7 @@ def main():
     print(f"[*] Initializing Portfolio 1 Backtest for {args.model}...")
 
     DATA_DIR    = os.path.join(PROJECT_ROOT, "data", "processed")
-    RESULTS_DIR = os.path.join(PROJECT_ROOT, "data", "results")
+    RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
     ALPHA       = 0.05
     TRAIN_END   = pd.Timestamp("2024-12-31")
     OOS_START   = pd.Timestamp("2025-01-02")
@@ -95,7 +95,7 @@ def main():
     COP_PATH = os.path.join("copulas", "static" if args.model == "M0" else "gas" if args.model in ["M1", "M3"] else "neural", COP_DICT[args.model])
 
     # 2. DATA LOADING
-    df_factors = pd.read_csv(os.path.join(RESULTS_DIR, "factors", "hierarchical_all_factors.csv"), index_col=0, parse_dates=True)
+    df_factors = pd.read_csv(os.path.join(RESULTS_DIR, "factors", "factors.csv"), index_col=0, parse_dates=True)
     df_returns = pd.read_csv(os.path.join(DATA_DIR, "returns.csv"), index_col=0, parse_dates=True)
     
     with open(os.path.join(RESULTS_DIR, SPOT_MARG_PATH), "rb") as f:
@@ -150,9 +150,15 @@ def main():
     generator = UniversalScenarioGenerator(valid_names, copula, args.model)
     generator.classify_marginals(marginals)
 
-    cols = ['underlying_symbol', 'quote_datetime', 'underlying_mid_price', 'tau', 'strike', 'option_type', 'delta', 'rate']
-    df_parquet = pd.read_parquet(os.path.join(DATA_DIR, "options_surfaces_data_cleaned.parquet"), columns=cols)
-    df_parquet['quote_datetime'] = pd.to_datetime(df_parquet['quote_datetime'])
+    cols = [
+        'underlying_symbol', 'quote_datetime', 'underlying_mid_price', 
+        'tau', 'strike', 'option_type', 'delta', 'rate', 
+        'log_moneyness', 'implied_volatility'
+    ]
+    df_parquet = pd.read_parquet(
+        os.path.join(DATA_DIR, "options_surfaces_data_cleaned.parquet"), 
+        columns=cols
+    )
     parquet_by_date = {d: grp.reset_index(drop=True) for d, grp in df_parquet.groupby('quote_datetime')}
 
     # 4. ROLLING BACKTEST
@@ -168,10 +174,14 @@ def main():
         df_today = parquet_by_date[t0]
         
         portfolio = Portfolio1_RiskReversal(df_today, t0, n_contracts=1000, target_dte=30)
-        if not portfolio.rrs: continue
+        if not portfolio.rrs: 
+            print(f"Skipped {t_tmrw.date()}: Empty Portfolio Book") 
+            continue
 
         init_states = {n: all_states[n][i] for n in valid_names if all_states[n][i] is not None}
-        if len(init_states) != len(valid_names): continue
+        if len(init_states) != len(valid_names): 
+            print(f"Skipped {t_tmrw.date()}: Missing GARCH states. Found {len(init_states)}/{len(valid_names)}")
+            continue
 
         paths_j, paths_i = generator.simulate_1day_dual(args.paths, init_states, marginals)
         real_row = real_paths_matrix[i + 1].reshape(1, -1)

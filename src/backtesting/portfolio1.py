@@ -26,8 +26,8 @@ class Portfolio1_RiskReversal:
             try:
                 surf = SSVI(sub, symbol=sym, quote_datetime=current_date)
                 surf.fit(max_iter=5000)
-            except Exception:
-                continue
+            except Exception as e:
+                print(f"SSVI Fit Failed for {sym}: {e}")
 
             # --- 2. FIND CLOSEST OPTIONS ---
             win = sub[(sub['tau'] >= 25/365.25) & (sub['tau'] <= 45/365.25)]
