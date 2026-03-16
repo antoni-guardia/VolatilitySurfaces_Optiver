@@ -24,7 +24,7 @@ from src.backtesting.utils.generators import UniversalScenarioGenerator, Dynamic
 from src.backtesting.p1_backtest import RiskModelUnpickler, precompute_garch_states
 
 def main():
-    torch.set_num_threads(18) 
+    torch.set_num_threads(45)
     print("=" * 80)
     print(" PORTFOLIO 1 -- MULTI-DAY VANNA SIMULATION (M2 vs Baselines)")
     print("=" * 80)
@@ -74,7 +74,7 @@ def main():
 
     # 2. Setup Copulas
     m0_path = os.path.join(RESULTS_DIR, "copulas", "static", "joint_vine_spot_har_garch_evt_model.json")
-    gauss_path = os.path.join(RESULTS_DIR, "copulas", "static", "gaussian_vine_spot_har_garch_evt_model.json")
+    gauss_path = os.path.join(RESULTS_DIR, "copulas", "gaussian", "gaussian_vine_spot_har_garch_evt_model.json")
     m2_path = os.path.join(RESULTS_DIR, "copulas", "neural", "neural_vine_spot_har_garch_evt_model.pth")
     
     m0_copula = pv.Vinecop.from_file(m0_path)

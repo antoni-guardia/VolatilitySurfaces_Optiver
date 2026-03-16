@@ -66,3 +66,22 @@ def diebold_mariano_test(loss_a, loss_b, h=1):
 def tick_loss(pnl_real, var_forecast, alpha=0.05):
     e = pnl_real - var_forecast
     return np.where(e < 0, (1 - alpha) * np.abs(e), alpha * np.abs(e))
+
+def compute_risk_metrics(pnl, alpha=0.05):
+    """Extracts Value-at-Risk and Expected Shortfall from a simulated PnL distribution."""
+    var = float(np.percentile(pnl, alpha * 100))
+    # Handle edge cases where no scenarios breach the VaR threshold
+    es = float(pnl[pnl <= var].mean()) if (pnl <= var).any() else var
+    return var, es
+
+def bootstrap_es(pnl, alpha=0.05, n_boot=1000):
+    """Calculates 95% Confidence Interval for Expected Shortfall via Vectorized Bootstrapping."""
+    n = len(pnl)
+    idx = np.random.randint(0, n, size=(n_boot, n))
+    samples = pnl[idx]
+    vars_boot = np.percentile(samples, alpha * 100, axis=1)
+    es_boot = np.array([
+        samples[i, samples[i] <= vars_boot[i]].mean() if (samples[i] <= vars_boot[i]).any() else vars_boot[i] 
+        for i in range(n_boot)
+    ])
+    return float(np.percentile(es_boot, 2.5)), float(np.percentile(es_boot, 97.5))
