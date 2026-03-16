@@ -22,7 +22,7 @@ from src.dynamics.NeuralSDE import NeuralSDE
 from src.dynamics.NGARCH_T import NGARCH_T
 from src.backtesting.portfolio1 import Portfolio1_RiskReversal
 from src.backtesting.utils.risk_metrics import tick_loss, kupiec_pof_test, christoffersen_test, mcneil_frey_test, diebold_mariano_test
-from src.backtesting.utils.generators import UniversalScenarioGenerator, DynamicVineWrapper
+from src.backtesting.utils.generators import UniversalScenarioGenerator, DynamicGASVine, DynamicNeuralVine
 
 class RiskModelUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
@@ -110,26 +110,23 @@ def main():
     with open(os.path.join(RESULTS_DIR, FACTOR_MARG_PATH), "rb") as f:
         factor_marginals = RiskModelUnpickler(f).load()
     
-    # Initialize marginals with the spot NGARCH models
     marginals = {**spot_marginals}
 
-    # --- MELVIN'S SAFE NSDE REHYDRATION ---
     if args.model in ["M3", "M4"]:
-        replace_count = 0
+        loaded_count = 0
         for k, v in factor_marginals.items():
-            if k in marginals:
-                replace_count += 1
             if isinstance(v, dict) and 'state_dict' in v:
                 m = NeuralSDE(v['params'], device='cpu')
                 m.load_state_dict(v['state_dict'])
                 m.eval()
                 marginals[k] = m
+                loaded_count += 1
             else: 
                 marginals[k] = v
-        print(f"[+] Successfully rehydrated {len(factor_marginals)} NSDE marginals.")
+        print(f"[+] Successfully initialized {loaded_count} Neural SDE factor models.")
     else:
-        # For M0, M1, M2 (HAR-GARCH), just merge the dictionaries directly
         marginals.update(factor_marginals)
+        print(f"[+] Successfully merged {len(factor_marginals)} HAR-GARCH factor models.")
 
     with open(os.path.join(RESULTS_DIR, "factors", "surfaces_dict.pkl"), "rb") as f:
         surfaces_dict = pickle.load(f)
@@ -156,24 +153,31 @@ def main():
 
     # 3. COPULA & GENERATOR SETUP
     full_cop_path = os.path.join(RESULTS_DIR, COP_PATH)
+    static_base_name = "joint_vine_spot_nsde_model.json" if args.model in ["M3", "M4"] else "joint_vine_spot_har_garch_evt_model.json"
+    static_base = os.path.join(RESULTS_DIR, "copulas", "static", static_base_name)
 
     if args.model == "M0":
         copula = pv.Vinecop.from_file(full_cop_path)
-    else:
-        # Load Uniform Files for Warmup
-        unif_filename = "uniforms_nsde_train.csv" if args.model in ["M3", "M4"] else "uniforms_har_garch_evt_train.csv"
-        unif_dir = os.path.join(RESULTS_DIR, "dynamics", "NSDE" if args.model in ["M3", "M4"] else "HAR_GARCH")
+    elif args.model in ["M1", "M3"]:
+        copula = DynamicGASVine(full_cop_path, static_base)
+    elif args.model in ["M2", "M4"]:
+        # Safe Uniform Rehydration for the 60-day Warmup
+        df_unif_spot = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "NGARCH", "uniforms_ngarch_train.csv"), index_col=0, parse_dates=True)
+        df_har_uniforms = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "HAR_GARCH", "uniforms_har_garch_evt_train.csv"), index_col=0, parse_dates=True)
         
-        df_unif_factor = pd.read_csv(os.path.join(unif_dir, unif_filename), index_col=0, parse_dates=True)
-        df_unif_spot   = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "NGARCH", "uniforms_ngarch_train.csv"), index_col=0, parse_dates=True)
-        
-        df_unif_merged = pd.concat([df_unif_spot, df_unif_factor], axis=1).reindex(columns=valid_names).ffill().bfill()
+        if args.model == "M4":
+            df_nsde_uniforms = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "NSDE", "uniforms_nsde_train.csv"), index_col=0, parse_dates=True)
+            df_factor_uniforms = df_har_uniforms.copy()
+            for col in df_nsde_uniforms.columns:
+                if col in df_factor_uniforms.columns:
+                    df_factor_uniforms[col] = df_nsde_uniforms[col]
+        else:
+            df_factor_uniforms = df_har_uniforms
+            
+        df_unif_merged = pd.concat([df_unif_spot, df_factor_uniforms], axis=1).reindex(columns=valid_names).ffill().bfill()
         history_window = df_unif_merged.iloc[-60:].values 
         
-        static_base_name = "joint_vine_spot_nsde_model.json" if args.model in ["M3", "M4"] else "joint_vine_spot_har_garch_evt_model.json"
-        static_base = os.path.join(RESULTS_DIR, "copulas", "static", static_base_name)
-        
-        copula = DynamicVineWrapper(full_cop_path, static_base, history_window, "GAS" if args.model in ["M1", "M3"] else "Neural")
+        copula = DynamicNeuralVine(full_cop_path, static_base, history_window)
 
     generator = UniversalScenarioGenerator(valid_names, copula, args.model)
     generator.classify_marginals(marginals)
@@ -202,14 +206,10 @@ def main():
         df_today = parquet_by_date[t0]
         
         portfolio = Portfolio1_RiskReversal(df_today, t0, n_contracts=1000, target_dte=30)
-        if not portfolio.rrs: 
-            print(f"Skipped {t_tmrw.date()}: Empty Portfolio Book") 
-            continue
+        if not portfolio.rrs: continue
 
         init_states = {n: all_states[n][i] for n in valid_names if all_states[n][i] is not None}
-        if len(init_states) != len(valid_names): 
-            print(f"Skipped {t_tmrw.date()}: Missing GARCH states. Found {len(init_states)}/{len(valid_names)}")
-            continue
+        if len(init_states) != len(valid_names): continue
 
         paths_j, paths_i = generator.simulate_1day_dual(args.paths, init_states, marginals)
         real_row = real_paths_matrix[i + 1].reshape(1, -1)
@@ -227,6 +227,7 @@ def main():
             'Indep_VaR': var_i, 'Indep_ES': es_i, 'Indep_Std': float(pnl_i.std()), 'Indep_Hit': int(real_pnl < var_i),
         })
 
+        # STATEFUL UPDATE: Only push the single new observation, maintaining continuous memory
         if args.model != "M0":
             u_realized = generator.calculate_realized_uniforms(real_row[0], init_states, marginals)
             copula.update_states(u_realized)
@@ -235,7 +236,6 @@ def main():
     df_res = pd.DataFrame(results)
     rpnl, vh, ih = df_res['Realized_PnL'].values, df_res['Vine_Hit'].values, df_res['Indep_Hit'].values
 
-    # Run all tests
     vine_kup_p = kupiec_pof_test(vh, ALPHA)
     vine_cc_p, vine_ind_p, vine_uc_p = christoffersen_test(vh, ALPHA)
     vine_mf_stat, vine_mf_p, _ = mcneil_frey_test(rpnl, df_res['Vine_ES'].values, df_res['Vine_Std'].values, vh)
@@ -265,39 +265,10 @@ def main():
     print(f" Indep VaR mean {df_res['Indep_VaR'].mean():.0f}  |  ES mean       {df_res['Indep_ES'].mean():.0f}")
     print(f"{'='*80}")
     
-    # Save CSV
     os.makedirs(os.path.join(RESULTS_DIR, "backtests"), exist_ok=True)
     out_path = os.path.join(RESULTS_DIR, "backtests", f"p1_results_{args.model}.csv")
     df_res.to_csv(out_path, index=False)
     print(f" Saved data to {out_path}")
-
-    # --- GENERATE VAR EXCEEDANCE PLOT ---
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    
-    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
-    plt.figure(figsize=(12, 6))
-    
-    dates = pd.to_datetime(df_res['Date'])
-    plt.plot(dates, df_res['Realized_PnL'], label="Realised P&L", color="black", alpha=0.6, lw=1.5)
-    plt.plot(dates, df_res['Vine_VaR'], label=f"Vine VaR (95%)", color="#d62728", lw=2)
-    plt.plot(dates, df_res['Indep_VaR'], label=f"Indep VaR (95%)", color="#1f77b4", lw=2, linestyle="--")
-    
-    # Highlight Vine Exceedances
-    exceed_mask = df_res['Vine_Hit'] == 1
-    plt.scatter(dates[exceed_mask], df_res['Realized_PnL'][exceed_mask], 
-                color="red", zorder=5, label="Vine Exceedance", marker="x", s=50)
-
-    plt.title(f"1-Day Out-of-Sample Portfolio 1 P&L vs Value-at-Risk ({args.model})", fontweight="bold")
-    plt.ylabel("Portfolio P&L ($)")
-    plt.xlabel("Date")
-    plt.legend(loc="best", frameon=True)
-    plt.tight_layout()
-    
-    plot_path = os.path.join(RESULTS_DIR, "backtests", f"p1_var_plot_{args.model}.png")
-    plt.savefig(plot_path, dpi=300)
-    plt.close()
-    print(f" Saved plot to {plot_path}")
 
 if __name__ == "__main__":
     main()

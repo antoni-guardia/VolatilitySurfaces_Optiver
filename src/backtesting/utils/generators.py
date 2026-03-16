@@ -7,160 +7,203 @@ from scipy.stats import norm, t as student_t
 from src.dependence.gas_mixed_vine import GASPairCopula
 from src.dependence.neural_mixed_vine import NeuralPairCopula
 
-class DynamicVineWrapper:
-    """Handles the rolling window hidden state updates for both GAS and Neural Vines."""
-    def __init__(self, pth_path, static_json_path, history_window, model_type):
+class DynamicGASVine:
+    def __init__(self, pth_path, static_json_path):
         self.base_copula = pv.Vinecop.from_file(static_json_path)
         self.matrix = np.array(self.base_copula.matrix, dtype=np.int64)
         self.N = self.matrix.shape[0]
-        if self.matrix.max() == self.N: self.matrix -= 1 
-        if np.sum(self.matrix[0] >= 0) > np.sum(self.matrix[-1] >= 0): self.matrix = np.flipud(self.matrix)
-        
-        self.history_window = np.array(history_window) # Shape (60, D)
         self.models = {}
         
-        saved_dict = torch.load(pth_path, map_location='cpu', weights_only=False)
-        
+        gas_dict = torch.load(pth_path, map_location='cpu', weights_only=False)
         for tree in range(self.N - 1):
             for edge in range(self.N - 1 - tree):
                 edge_key = f"T{tree}_E{edge}"
-                info = saved_dict.get(edge_key, None)
-                
+                info = gas_dict.get(edge_key, None)
                 if not info or info['family'] == 'indep':
                     self.models[edge_key] = None
                     continue
-                
-                if model_type == 'GAS':
-                    m = GASPairCopula(info['family'], info['rotation'])
-                    m.omega.data = torch.tensor(info['omega'])
-                    m.A.data = torch.tensor(info['A'])
-                    b_val = info['B']
-                    m.B_logit.data = torch.tensor(np.log(b_val / (1 - b_val + 1e-8)) if b_val < 1.0 else 10.0)
-                    if m.nu_param is not None and not np.isnan(info.get('nu', np.nan)):
-                        m.nu_param.data = torch.tensor(np.log(np.exp(max(info['nu'] - 2.01, 1e-6)) - 1))
-                else: # Neural
-                    m = NeuralPairCopula(
-                        info['family'], info['rotation'], 
-                        hidden_dim=info.get('hidden_dim', 8), 
-                        num_layers=info.get('num_layers', 1)
-                    )
-                    if 'state_dict' in info and info['state_dict'] is not None:
-                        m.load_state_dict(info['state_dict'])
-                        
-                m.eval()
-                
-                # Attach OOS forecast from the training dictionary
-                m.oos_forecast = torch.tensor(info.get('oos_forecast', 0.0))
-                self.models[edge_key] = m
-                
-        self._push_to_cpp()
-
-    def simulate(self, n_scenarios):
-        return self.base_copula.simulate(n_scenarios)
-
-    def update_states(self, u_realized):
-        """Rolls the 60-day window forward and updates the Vine copula parameters."""
-        self.history_window = np.vstack([self.history_window[1:], u_realized])
-        
-        u_tensor = torch.tensor(self.history_window, dtype=torch.float64)
-        h_storage = {(i, -1): u_tensor[:, i] for i in range(self.N)}
-        
-        for tree in range(self.N - 1):
-            for edge in range(self.N - 1 - tree):
-                row, col = self.N - 1 - tree, edge
-                var_1 = self.matrix[row, col]
-                u_vec = h_storage[(var_1, -1)] if tree == 0 else h_storage[(col, tree-1)]
-                
-                var_2 = self.matrix[col, col]
-                partner_col = -1
-                if tree == 0: v_vec = h_storage[(var_2, -1)]
-                else:
-                    for k in range(self.N):
-                        if self.matrix[row+1, k] == var_2: partner_col = k; break
-                    v_vec = h_storage[(partner_col, tree-1)]
                     
-                m = self.models[f"T{tree}_E{edge}"]
-                if m is None:
-                    h_storage[(edge, tree)] = u_vec
-                    if tree < self.N - 2: h_storage[(partner_col, tree)] = v_vec
-                else:
-                    # Conditional Autograd depending on Neural vs GAS
-                    if hasattr(m, 'rnn'): 
-                        with torch.no_grad():
-                            _, theta_seq = m(u_vec, v_vec)
-                    else: 
-                        with torch.enable_grad():
-                            _, theta_seq = m(u_vec, v_vec)
-                            
-                    with torch.no_grad():
-                        theta_seq = theta_seq.detach()
-                        nu = m.get_nu()
-                        h_dir = m.compute_h_func(u_vec, v_vec, theta_seq.squeeze(), nu)
-                        h_indir = m.compute_h_func(v_vec, u_vec, theta_seq.squeeze(), nu)
-                        
-                        h_storage[(edge, tree)] = h_dir
-                        if tree < self.N - 2: h_storage[(partner_col, tree)] = h_indir
-                        
+                model = GASPairCopula(info['family'], info['rotation'])
+                model.omega.data = torch.tensor(info['omega'])
+                model.A.data = torch.tensor(info['A'])
+                b_val = info['B']
+                model.B_logit.data = torch.tensor(np.log(b_val / (1 - b_val + 1e-8)) if b_val < 1.0 else 10.0)
+                if model.nu_param is not None and not np.isnan(info.get('nu', np.nan)):
+                    model.nu_param.data = torch.tensor(np.log(np.exp(max(info['nu'] - 2.01, 1e-6)) - 1))
+                
+                oos = float(info['oos_forecast'])
+                if 'gaussian' in info['family'] or 'student' in info['family']: f_init = np.arctanh(np.clip(oos / 0.999, -0.99, 0.99))
+                elif 'clayton' in info['family']: f_init = np.log(np.exp(max(oos - 1e-5, 1e-6)) - 1)
+                elif 'gumbel' in info['family']: f_init = np.log(np.exp(max(oos - 1.0001, 1e-6)) - 1)
+                else: f_init = oos
+                    
+                model.f_t = torch.tensor(f_init)
+                self.models[edge_key] = model
         self._push_to_cpp()
-
+        
     def _push_to_cpp(self):
-        # 1. Build a pure Python list of lists to satisfy PyBind11
         pcs_list = []
-        
-        # --- FIX: Read the exact truncation level from the C++ object ---
         trunc_lvl = len(self.base_copula.pair_copulas)
-        
-        # Only loop up to the truncation level (e.g., 10 or 13)
         for tree in range(trunc_lvl):
             tree_list = []
             for edge in range(self.N - 1 - tree):
-                # Extract a copy of the Bicop from the original structure
                 pc = self.base_copula.get_pair_copula(tree, edge)
-                
-                m = self.models[f"T{tree}_E{edge}"]
-                if m:
-                    # Transform raw f_t into bounded theta_t
-                    theta_oos = float(m.transform_parameter(m.oos_forecast).item())
+                model = self.models[f"T{tree}_E{edge}"]
+                if model:
+                    # FIX: GAS natively stores its forecast in model.f_t
+                    theta = float(model.transform_parameter(model.f_t).item())
+                    nu = model.get_nu()
                     
                     if pc.parameters.shape[0] == 2:
-                        nu = m.get_nu()
                         nu_val = float(nu.item()) if nu is not None else 5.0
-                        theta_oos = np.clip(theta_oos, -0.999, 0.999)
-                        params = np.array([[theta_oos], [nu_val]])
+                        params = np.array([[np.clip(theta, -0.999, 0.999)], [nu_val]])
                     else:
-                        if any(f in m.family for f in ['gaussian', 'student']):
-                            theta_oos = np.clip(theta_oos, -0.999, 0.999)
-                        elif 'frank' in m.family:
-                            theta_oos = np.clip(theta_oos, -40.0, 40.0)
-                            if abs(theta_oos) < 1e-4: theta_oos = 1e-4 
-                        elif 'clayton' in m.family:
-                            theta_oos = np.clip(theta_oos, 1e-5, 28.0)
-                        elif 'gumbel' in m.family:
-                            theta_oos = np.clip(theta_oos, 1.001, 28.0)
-                            
-                        params = np.array([[theta_oos]])
-                        
-                    # Inject parameters into the extracted copy
+                        if any(f in model.family for f in ['gaussian', 'student']): theta = np.clip(theta, -0.999, 0.999)
+                        elif 'frank' in model.family: theta = np.clip(theta, -40.0, 40.0); theta = 1e-4 if abs(theta) < 1e-4 else theta
+                        elif 'clayton' in model.family: theta = np.clip(theta, 1e-5, 28.0)
+                        elif 'gumbel' in model.family: theta = np.clip(theta, 1.001, 28.0)
+                        params = np.array([[theta]])
                     pc.parameters = params
-                
-                # Append the Bicop object to the inner list
                 tree_list.append(pc)
-                
-            # Append the tree list to the main list
             pcs_list.append(tree_list)
+        self.base_copula = pv.Vinecop.from_structure(structure=self.base_copula.structure, pair_copulas=pcs_list)
+        
+    def simulate(self, n_scenarios): return np.clip(self.base_copula.simulate(n_scenarios), 1e-6, 1 - 1e-6)
+
+    def update_states(self, u_realized_np):
+        u_tensor = torch.tensor(u_realized_np, dtype=torch.float64).view(1, -1)
+        M = self.matrix
+        if M.max() == self.N: M -= 1 
+        if np.sum(M[0] >= 0) > np.sum(M[-1] >= 0): M = np.flipud(M)
+            
+        h_storage = {(i, -1): u_tensor[:, i] for i in range(self.N)}
+        for tree in range(self.N - 1):
+            for edge in range(self.N - 1 - tree):
+                row, col = self.N - 1 - tree, edge
+                u_vec = h_storage[(M[row, col], -1)] if tree == 0 else h_storage[(col, tree-1)]
+                var_2, partner_col = M[col, col], -1
+                
+                if tree == 0: v_vec = h_storage[(var_2, -1)]
+                else:
+                    for k in range(self.N):
+                        if M[row+1, k] == var_2: partner_col = k; break
+                    v_vec = h_storage[(partner_col, tree-1)]
                     
-        # 2. RE-INSTANTIATE THE VINECOP
-        self.base_copula = pv.Vinecop.from_structure(
-            structure=self.base_copula.structure, 
-            pair_copulas=pcs_list
-        )
+                model = self.models[f"T{tree}_E{edge}"]
+                if model is None:
+                    h_storage[(edge, tree)] = u_vec
+                    if tree < self.N - 2: h_storage[(partner_col, tree)] = v_vec
+                else:
+                    _, _, h_dir, h_indir = model.update_step(u_vec, v_vec)
+                    h_storage[(edge, tree)] = h_dir
+                    if tree < self.N - 2: h_storage[(partner_col, tree)] = h_indir
+        self._push_to_cpp()
+
+class DynamicNeuralVine:
+    def __init__(self, pth_path, static_json_path, history_window):
+        self.base_copula = pv.Vinecop.from_file(static_json_path)
+        self.matrix = np.array(self.base_copula.matrix, dtype=np.int64)
+        self.N = self.matrix.shape[0]
+        self.models = {}
+        
+        neural_dict = torch.load(pth_path, map_location='cpu', weights_only=False)
+
+        for tree in range(self.N - 1):
+            for edge in range(self.N - 1 - tree):
+                edge_key = f"T{tree}_E{edge}"
+                info = neural_dict.get(edge_key, None)
+
+                if not info or info.get('family') == 'indep':
+                    self.models[edge_key] = None
+                    continue
+                
+                model = NeuralPairCopula(
+                    family=info['family'], 
+                    rotation=info.get('rotation', 0),
+                    hidden_dim=info.get('hidden_dim', 8),
+                    num_layers=info.get('num_layers', 1),
+                    dropout=info.get('dropout', 0.0)
+                )
+                
+                if 'state_dict' in info:
+                    model.load_state_dict(info['state_dict'], strict=True)
+                
+                model.eval()
+                self.models[edge_key] = model
+                
+        self._warm_up(history_window)
+        self._push_to_cpp()
+
+    def _warm_up(self, history_window):
+        for t in range(history_window.shape[0]):
+            self.update_states(history_window[t:t+1])
+            
+    def _push_to_cpp(self):
+        pcs_list = []
+        trunc_lvl = len(self.base_copula.pair_copulas)
+        for tree in range(trunc_lvl):
+            tree_list = []
+            for edge in range(self.N - 1 - tree):
+                pc = self.base_copula.get_pair_copula(tree, edge)
+                model = self.models[f"T{tree}_E{edge}"]
+                if model:
+                    with torch.no_grad():
+                        dummy_in = torch.zeros(1, 1, 2)
+                        out, _ = model.rnn(dummy_in, model.hidden_state)
+                        f_t = model.head(out).squeeze()
+                        theta = float(model.transform_parameter(f_t).item())
+                        nu = model.get_nu()
+                    
+                    if pc.parameters.shape[0] == 2:
+                        nu_val = float(nu.item()) if nu is not None else 5.0
+                        params = np.array([[np.clip(theta, -0.999, 0.999)], [nu_val]])
+                    else:
+                        if any(f in model.family for f in ['gaussian', 'student']): theta = np.clip(theta, -0.999, 0.999)
+                        elif 'frank' in model.family: theta = np.clip(theta, -40.0, 40.0); theta = 1e-4 if abs(theta) < 1e-4 else theta
+                        elif 'clayton' in model.family: theta = np.clip(theta, 1e-5, 28.0)
+                        elif 'gumbel' in model.family: theta = np.clip(theta, 1.001, 28.0)
+                        params = np.array([[theta]])
+                    pc.parameters = params
+                tree_list.append(pc)
+            pcs_list.append(tree_list)
+        self.base_copula = pv.Vinecop.from_structure(structure=self.base_copula.structure, pair_copulas=pcs_list)
+                
+    def simulate(self, n_scenarios): return np.clip(self.base_copula.simulate(n_scenarios), 1e-6, 1 - 1e-6)
+
+    def update_states(self, u_realized_np):
+        u_tensor = torch.tensor(u_realized_np, dtype=torch.float64).view(1, -1)
+        M = self.matrix
+        if M.max() == self.N: M -= 1 
+        if np.sum(M[0] >= 0) > np.sum(M[-1] >= 0): M = np.flipud(M)
+            
+        h_storage = {(i, -1): u_tensor[:, i] for i in range(self.N)}
+        for tree in range(self.N - 1):
+            for edge in range(self.N - 1 - tree):
+                row, col = self.N - 1 - tree, edge
+                u_vec = h_storage[(M[row, col], -1)] if tree == 0 else h_storage[(col, tree-1)]
+                var_2, partner_col = M[col, col], -1
+                
+                if tree == 0: v_vec = h_storage[(var_2, -1)]
+                else:
+                    for k in range(self.N):
+                        if M[row+1, k] == var_2: partner_col = k; break
+                    v_vec = h_storage[(partner_col, tree-1)]
+                    
+                model = self.models[f"T{tree}_E{edge}"]
+                if model is None:
+                    h_storage[(edge, tree)] = u_vec
+                    if tree < self.N - 2: h_storage[(partner_col, tree)] = v_vec
+                else:
+                    _, _, h_dir, h_indir = model.step_forward(u_vec, v_vec)
+                    h_storage[(edge, tree)] = h_dir
+                    if tree < self.N - 2: h_storage[(partner_col, tree)] = h_indir
+        self._push_to_cpp()
 
 class UniversalScenarioGenerator:
     def __init__(self, factor_order, copula_model, model_id):
         self.factor_order = factor_order
         self.copula = copula_model 
         self.model_id = model_id
-        
         self._ng_idx, self._har_idx, self._nsde_idx = [], [], []
 
     def classify_marginals(self, marginals):

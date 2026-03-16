@@ -247,6 +247,19 @@ class GASPairCopula(nn.Module):
 
         if self.rotation in [90, 270]: h_val = 1 - h_val
         return torch.clamp(h_val, eps, 1 - eps)
+    
+    def update_step(self, u_val, v_val):
+        if 'indep' in self.family: return torch.tensor(0.0), torch.tensor(0.0), u_val, v_val
+        u_t, v_t, nu = u_val.view(-1), v_val.view(-1), self.get_nu()
+        f_t_leaf = self.f_t.detach().requires_grad_(True)
+        ll = self.log_likelihood_pair(u_t, v_t, self.transform_parameter(f_t_leaf), nu).sum()
+        score = torch.autograd.grad(ll, f_t_leaf, create_graph=False)[0].view(-1)
+        
+        self.f_t = (self.omega + self.A * torch.clamp(score.detach(), min=-10.0, max=10.0).squeeze() + self.get_B() * (self.f_t - self.omega)).detach()
+        theta_next = self.transform_parameter(self.f_t)
+        
+        with torch.no_grad():
+            return theta_next, nu, self.compute_h_func(u_t, v_t, theta_next, nu), self.compute_h_func(v_t, u_t, theta_next, nu)
 
     def forward(self, u_data, v_data):
         T = u_data.shape[0]

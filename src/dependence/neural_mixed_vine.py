@@ -55,23 +55,19 @@ class NeuralPairCopula(nn.Module):
         super().__init__()
         self.family = str(family).split('.')[-1].lower()
         self.rotation = int(rotation)
-        
-        # SOTA GRU Architecture
-        self.rnn = nn.GRU(
-            input_size=2, 
-            hidden_size=hidden_dim, 
-            num_layers=num_layers, 
-            dropout=dropout if num_layers > 1 else 0.0, 
-            batch_first=True
-        )
+        self.rnn = nn.GRU(input_size=2, hidden_size=hidden_dim, num_layers=num_layers, dropout=dropout if num_layers > 1 else 0.0, batch_first=True)
         self.head = nn.Linear(hidden_dim, 1)
+        
         self.f_init = nn.Parameter(torch.tensor(0.0))
         
-        if 'student' in self.family:
+        if 'student' in self.family: 
             self.nu_param = nn.Parameter(torch.tensor(2.0))
-        else:
+        else: 
             self.register_parameter('nu_param', None)
-
+        
+        self.hidden_state = None
+        self._latest_f_t = self.f_init.clone()
+        
     def warm_start(self, static_theta, static_nu=None):
         if static_theta is not None:
             f_init = 0.0
@@ -114,6 +110,29 @@ class NeuralPairCopula(nn.Module):
             val = torch.where(mask, torch.sign(val + 1e-12) * 1e-4, val)
             return val
         return f_t
+    
+    @torch.no_grad()
+    def step_forward(self, u_val, v_val):
+        """Passes day t realized uniform through the GRU to predict theta t+1"""
+        if 'indep' in self.family: return torch.tensor(0.0), torch.tensor(0.0), u_val, v_val
+        u_t, v_t, nu = u_val.view(-1), v_val.view(-1), self.get_nu()
+        
+        eps = 1e-6
+        u_clamped, v_clamped = torch.clamp(u_t, eps, 1-eps), torch.clamp(v_t, eps, 1-eps)
+        x_in = torch.erfinv(2 * u_clamped - 1) * math.sqrt(2)
+        y_in = torch.erfinv(2 * v_clamped - 1) * math.sqrt(2)
+        inputs = torch.stack([x_in, y_in], dim=1).unsqueeze(0) 
+
+        # Update the memory (h_t)
+        rnn_out, self.hidden_state = self.rnn(inputs, self.hidden_state)
+        
+        # Project the forecast for t+1 (f_t+1)
+        self._latest_f_t = self.head(rnn_out).squeeze() 
+        theta_next = self.transform_parameter(self._latest_f_t)
+        
+        h_dir = self.compute_h_func(u_t, v_t, theta_next, nu)
+        h_indir = self.compute_h_func(v_t, u_t, theta_next, nu)
+        return theta_next, nu, h_dir, h_indir
 
     def log_likelihood_pair(self, u, v, theta, nu=None):
         u_rot, v_rot = self.rotate_data(u, v)

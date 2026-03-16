@@ -1,13 +1,11 @@
 import numpy as np
 import pandas as pd
 from src.backtesting.utils.black_scholes import bs_price_vec, bs_delta_vec, bilinear_interp_vec
-
 from src.fitting.ssvi import SSVI 
 
 class Portfolio1_RiskReversal:
     def __init__(self, df_today, current_date, n_contracts=1000, target_dte=30):
         self.n_contracts = n_contracts
-        # Pass the specific day's DataFrame and date to build the book
         self.rrs = self._build_book(df_today, current_date, target_dte)
 
     def _build_book(self, df_today, current_date, target_dte):
@@ -19,18 +17,21 @@ class Portfolio1_RiskReversal:
             if sub.empty: continue
             
             S0 = sub['underlying_mid_price'].mean()
-            # Default to 0.0 if rate is missing, else convert from %
-            r0 = float(sub['rate'].mean() / 100.0) if 'rate' in sub.columns else 0.0
+            
+            # STRICT FORWARD-PARITY: Remove exogenous interest rate noise
+            r0 = 0.0 
 
-            # --- 1. FIT SSVI ON THE FLY ---
+            # 1. FIT SSVI ON THE FLY
             try:
                 surf = SSVI(sub, symbol=sym, quote_datetime=current_date)
                 surf.fit(max_iter=5000)
             except Exception as e:
-                print(f"SSVI Fit Failed for {sym}: {e}")
+                continue
 
-            # --- 2. FIND CLOSEST OPTIONS ---
-            win = sub[(sub['tau'] >= 25/365.25) & (sub['tau'] <= 45/365.25)]
+            # 2. FIND CLOSEST OPTIONS (With Fallback Logic)
+            win = sub[(sub['tau'] >= 25/365.25) & (sub['tau'] <= 45/365.25)].copy()
+            if win.empty: 
+                win = sub[sub['tau'] >= 25/365.25].copy() # Fallback to preserve portfolio diversity
             if win.empty: continue
 
             best_tau = win.loc[(win['tau'] - target_tau).abs().idxmin()]['tau']
