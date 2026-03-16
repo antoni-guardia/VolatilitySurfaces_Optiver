@@ -142,7 +142,7 @@ def main():
     for sym in set([s.split('_')[2] for s in valid_names if s.startswith("L_PC_")]):
         factor_idx_map[sym] = [name_to_col[n] for n in valid_names if n.startswith(f"L_PC_{sym}_")]
 
-    oos_dates = df_returns[(df_returns.index >= OOS_START) & (df_returns.index <= OOS_END)].index
+    oos_dates = df_returns[(df_returns.index >= TRAIN_END) & (df_returns.index <= OOS_END)].index
     all_states = precompute_garch_states(valid_names, marginals, df_returns, df_factors, oos_dates, TRAIN_END)
     
     real_paths_matrix = np.zeros((len(oos_dates), len(valid_names)))
