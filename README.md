@@ -71,7 +71,6 @@ flowchart TD
     Preproc --> SSVI
     SSVI --> PCA
 
-    PCA --> Spot
     PCA --> VolHAR
     PCA --> VolNSDE
 
