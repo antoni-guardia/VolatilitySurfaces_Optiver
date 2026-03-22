@@ -1,5 +1,5 @@
 # Leverage and Contagion Effects in Implied Volatility Surfaces: A Mixed Neural Vine Copula Approach
-_Project by Luca Leimbeck Del Duca | **Partner Firm:** Optiver (Group A)  
+_Project by Luca Leimbeck Del Duca | **Partner Firm:** Optiver_
 
 This project introduces a unified deep generative framework to forecast the joint evolution of implied volatility surfaces across a high-dimensional universe of assets. By decomposing the forecasting problem into geometry, dynamics, and topology stages, the study demonstrates improved modeling of asymmetric tail dependence and contagion effects, significantly outperforming traditional static and Gaussian benchmarks. 
 
